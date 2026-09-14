@@ -1,0 +1,75 @@
+# The deployed stack. Source of truth for what runs on the server.
+#
+# Written because the database was first brought up with a `docker run` typed
+# into a terminal, which means the infrastructure existed only in a shell
+# history -- the same non-reproducibility this project exists to argue against.
+# If it is not in a file, it cannot be rebuilt.
+#
+# The host (Oracle Cloud ARM, 2 cores / 11 GB) already runs open-webui, n8n and
+# discord-listener on ports 3001, 5678 and 8088. Nothing here touches those.
+#
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# The compose plugin is not installed on the box yet; `deploy/up.sh` does the
+# same thing with plain `docker run` in the meantime.
+
+name: btb
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: btb-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: btb
+      POSTGRES_PASSWORD: ${BTB_DB_PASSWORD:?set BTB_DB_PASSWORD}
+      POSTGRES_DB: btb
+      # The server runs in UTC. Bar timestamps are epoch seconds so this is
+      # belt-and-braces, but a server in local time has produced this exact
+      # class of off-by-an-hour bug for everyone who has ever hit it.
+      TZ: UTC
+      PGTZ: UTC
+    # Bound to LOCALHOST ONLY, never 0.0.0.0. The app and worker reach the
+    # database over the compose network; a developer reaches it through
+    # `ssh -L 55432:127.0.0.1:5432`. There is no configuration in which this
+    # listens on a public interface.
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    shm_size: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U btb -d btb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # The Python worker. Currently used for data ingestion; from Weeks 3-5 it also
+  # claims sweep jobs from the `jobs` table.
+  #
+  # One core, not two. The box's other services are idle, but pinning both cores
+  # makes open-webui visibly laggy for the duration of a sweep -- and a sweep
+  # taking 30 seconds instead of 15 is not worth that.
+  worker:
+    build: ../backend
+    image: btb-backend
+    container_name: btb-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      BTB_DB_HOST: btb-postgres
+      BTB_DB_PORT: "5432"
+      BTB_DB_NAME: btb
+      BTB_DB_USER: btb
+      BTB_DB_PASSWORD: ${BTB_DB_PASSWORD:?set BTB_DB_PASSWORD}
+      TZ: UTC
+    cpus: 1.0
+    mem_limit: 2g
+    command: ["btb.data", "list"]
+
+volumes:
+  pgdata:
+    name: btb_pgdata
