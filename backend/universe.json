@@ -1,0 +1,62 @@
+{
+  "_comment": [
+    "The curated universe. A public app must never let a visitor trigger an",
+    "arbitrary fetch, so this file is the complete list of what exists.",
+    "`python -m btb.data build` ingests exactly this and nothing else.",
+    "",
+    "HISTORY IS TIERED BY TIMEFRAME, on purpose. Fine timeframes get less",
+    "history than coarse ones, for a research reason before a cost one: 5m bars",
+    "from 2012 Bitstamp describe a market that no longer exists (2.7% of those",
+    "bars have zero range and zero volume). A 5m strategy validated on them is",
+    "validated against microstructure nobody trades today. The tiers are in",
+    "btb/data/ingest.py:HISTORY_YEARS and are recorded per series.",
+    "",
+    "EQUITY INTRADAY IS SEVERELY CAPPED BY THE SOURCE. Yahoo serves 58 days of",
+    "5m/15m/30m and 725 days of 1h, measured. Those series are ingested so the",
+    "pipeline is exercised end to end, and they will carry a thin-sample",
+    "warning. They are NOT adequate for research. Fixing that needs Alpaca",
+    "(free key, minute data back to 2016) and is tracked as an open item.",
+    "",
+    "Bitstamp has no 4h gap and no 2h-vs-4h ambiguity; Yahoo has no 4h at all,",
+    "which is why the crypto and equity timeframe lists differ."
+  ],
+
+  "crypto": {
+    "source": "crypto",
+    "venue": "bitstamp",
+    "timeframes": ["5m", "15m", "30m", "1h", "4h", "1d"],
+    "symbols": [
+      {"symbol": "BTC/USD",  "name": "Bitcoin",       "sector": "Store of value"},
+      {"symbol": "ETH/USD",  "name": "Ethereum",      "sector": "Smart contract"},
+      {"symbol": "XRP/USD",  "name": "XRP",           "sector": "Payments"},
+      {"symbol": "LTC/USD",  "name": "Litecoin",      "sector": "Payments"},
+      {"symbol": "BCH/USD",  "name": "Bitcoin Cash",  "sector": "Payments"},
+      {"symbol": "SOL/USD",  "name": "Solana",        "sector": "Smart contract"},
+      {"symbol": "ADA/USD",  "name": "Cardano",       "sector": "Smart contract"},
+      {"symbol": "DOT/USD",  "name": "Polkadot",      "sector": "Interoperability"},
+      {"symbol": "LINK/USD", "name": "Chainlink",     "sector": "Oracle"},
+      {"symbol": "AVAX/USD", "name": "Avalanche",     "sector": "Smart contract"},
+      {"symbol": "UNI/USD",  "name": "Uniswap",       "sector": "DeFi"},
+      {"symbol": "DOGE/USD", "name": "Dogecoin",      "sector": "Meme"}
+    ]
+  },
+
+  "equity": {
+    "source": "equity",
+    "timeframes": ["5m", "15m", "30m", "1h", "1d"],
+    "symbols": [
+      {"symbol": "SPY",  "name": "SPDR S&P 500 ETF",     "sector": "Broad index"},
+      {"symbol": "QQQ",  "name": "Invesco QQQ Trust",    "sector": "Tech index"},
+      {"symbol": "AAPL", "name": "Apple",                "sector": "Technology"},
+      {"symbol": "NVDA", "name": "NVIDIA",               "sector": "Semiconductors"},
+      {"symbol": "JPM",  "name": "JPMorgan Chase",       "sector": "Financials"},
+      {"symbol": "JNJ",  "name": "Johnson & Johnson",    "sector": "Healthcare"},
+      {"symbol": "XOM",  "name": "Exxon Mobil",          "sector": "Energy"},
+      {"symbol": "PG",   "name": "Procter & Gamble",     "sector": "Consumer staples"},
+      {"symbol": "AMZN", "name": "Amazon",               "sector": "Consumer discretionary"},
+      {"symbol": "CAT",  "name": "Caterpillar",          "sector": "Industrials"},
+      {"symbol": "NEE",  "name": "NextEra Energy",       "sector": "Utilities"},
+      {"symbol": "VZ",   "name": "Verizon",              "sector": "Communication services"}
+    ]
+  }
+}

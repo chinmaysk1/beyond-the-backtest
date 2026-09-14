@@ -1,0 +1,124 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model bars {
+  source    String
+  symbol    String
+  timeframe String
+  ts        BigInt
+  open      Float
+  high      Float
+  low       Float
+  close     Float
+  volume    Float
+  partial   Boolean @default(false)
+
+  @@id([source, symbol, timeframe, ts])
+  @@index([symbol, timeframe, source, ts], map: "bars_series_ts")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model events {
+  source String
+  symbol String
+  ts     BigInt
+  kind   String
+  ratio  Float?
+  amount Float?
+  label  String?
+
+  @@id([source, symbol, ts, kind])
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model jobs {
+  id          BigInt    @id @default(autoincrement())
+  user_id     String?   @db.Uuid
+  kind        String
+  payload     Json
+  status      String    @default("queued")
+  priority    Int       @default(100)
+  claimed_by  String?
+  claimed_at  DateTime? @db.Timestamptz(6)
+  finished_at DateTime? @db.Timestamptz(6)
+  error       String?
+  created_at  DateTime  @default(now()) @db.Timestamptz(6)
+  users       users?    @relation(fields: [user_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  runs        runs[]
+}
+
+/// This model contains an expression index which requires additional setup for migrations. Visit https://pris.ly/d/expression-indexes for more info.
+model runs {
+  id           BigInt      @id @default(autoincrement())
+  job_id       BigInt?
+  strategy_id  String?     @db.Uuid
+  symbol       String
+  timeframe    String
+  params       Json
+  window_start BigInt
+  window_end   BigInt
+  as_of        BigInt
+  split        String?
+  metrics      Json
+  created_at   DateTime    @default(now()) @db.Timestamptz(6)
+  jobs         jobs?       @relation(fields: [job_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  strategies   strategies? @relation(fields: [strategy_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([strategy_id, symbol, timeframe, split], map: "runs_lookup")
+}
+
+model series {
+  source          String
+  symbol          String
+  timeframe       String
+  asset_class     String?
+  first_ts        BigInt?
+  last_ts         BigInt?
+  row_count       Int       @default(0)
+  fetched_at      DateTime? @db.Timestamptz(6)
+  checked_at      DateTime? @db.Timestamptz(6)
+  venue_timezone  String?
+  feed_adjustment String?
+  integrity       Json?
+  meta            Json?
+
+  @@id([source, symbol, timeframe])
+}
+
+model strategies {
+  id         String   @id @db.Uuid
+  user_id    String?  @db.Uuid
+  name       String
+  spec       Json
+  spec_sha   String
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+  runs       runs[]
+  users      users?   @relation(fields: [user_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+}
+
+model universe {
+  symbol      String   @id
+  source      String
+  asset_class String
+  sector      String?
+  name        String?
+  timeframes  String[]
+  since       BigInt?
+  active      Boolean  @default(true)
+}
+
+model users {
+  id            String       @id @db.Uuid
+  email         String?      @unique
+  created_at    DateTime     @default(now()) @db.Timestamptz(6)
+  username      String?      @unique
+  password_hash String?
+  jobs          jobs[]
+  strategies    strategies[]
+}

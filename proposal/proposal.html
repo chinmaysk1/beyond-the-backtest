@@ -1,0 +1,313 @@
+<title>QuantLab Proposal</title>
+<style>
+  :root { --ink:#101010; --muted:#555; --paper:#fff; }
+
+  body {
+    background:#d9d7d2; margin:0; padding:34px 16px 70px;
+    font-family:"Latin Modern Roman", Georgia, "Times New Roman", serif;
+    color:var(--ink); -webkit-font-smoothing:antialiased;
+  }
+
+  /* US Letter, 1in margins */
+  main {
+    position:relative; box-sizing:border-box;
+    width:8.5in; max-width:100%; margin:0 auto;
+    background:var(--paper); padding:1in;
+    box-shadow:0 2px 22px rgba(0,0,0,.18);
+    font-size:11pt; line-height:1.38;
+  }
+
+  h1 { font-size:1.25em; font-weight:700; text-align:center; line-height:1.3; margin:0 0 .4em; }
+  .byline { text-align:center; font-size:.98em; margin:0 0 .8em; }
+
+  h2 { font-size:1.22em; font-weight:700; margin:.62em 0 .28em; }
+  h2:first-of-type { margin-top:0; }
+
+  p { margin:0 0 .5em; text-align:justify; hyphens:auto; }
+  ol, ul { margin:0 0 .6em; padding-left:1.4em; }
+  li { margin-bottom:.18em; text-align:justify; }
+
+  figure { margin:.5em 0 1.7em; }
+  figure svg { width:100%; height:auto; display:block; }
+  figcaption { font-size:.85em; margin-top:.35em; text-align:justify; color:var(--muted); }
+  figcaption .lbl { color:var(--ink); font-weight:700; }
+
+  table { width:100%; border-collapse:collapse; font-size:.86em; margin:.5em 0 .7em; }
+  th, td { padding:.28em .55em; vertical-align:top; text-align:left; }
+  thead th { border-top:1.1px solid var(--ink); border-bottom:.6px solid var(--ink); font-weight:700; }
+  tbody tr:last-child td { border-bottom:1.1px solid var(--ink); }
+  td.wk { white-space:nowrap; }
+
+  ol.refs { font-size:.81em; padding-left:1.7em; }
+  ol.refs li { margin-bottom:.19em; }
+  ol.refs a { color:inherit; }
+
+  /* page-boundary guides, screen only */
+  .pagebreak { position:absolute; left:0; right:0; border-top:1px dashed #c23b3b; pointer-events:none; }
+  .pagebreak span {
+    position:absolute; right:8px; top:-.85em;
+    font-family:system-ui,sans-serif; font-size:9px; letter-spacing:.04em;
+    color:#c23b3b; background:var(--paper); padding:0 4px;
+  }
+  #pagecount {
+    width:8.5in; max-width:100%; margin:0 auto 10px;
+    font-family:system-ui,sans-serif; font-size:11px; color:#6a6864;
+  }
+
+  @page { size: letter; margin: 1in; }
+
+  @media print {
+    body { background:#fff; padding:0; }
+    main { box-shadow:none; width:auto; padding:0; }
+    .pagebreak, #pagecount { display:none; }
+    /* Page 1 closes after the figure caption; Inputs opens page 2 under the
+       normal 1in top margin from @page. */
+    .newpage { break-before: page; }
+    figure { break-inside: avoid; }
+    h2 { break-after: avoid; }
+  }
+</style>
+
+<div id="pagecount"></div>
+
+<main>
+
+<h1>Project Proposal: A Guided Tool for Testing Trading Strategies</h1>
+
+<p class="byline">Chinmay Karur, ckarur@calpoly.edu</p>
+
+<h2>1. Problem Statement</h2>
+
+<p>Backtesting tools let anyone simulate a trading strategy over years of price
+history in seconds, but for a regular investor the result is basically a black
+box. They default to zero trading costs, so the return leaves out the fees that
+decide whether a strategy makes money at all. In my own testing, turning costs
+on changed a simulated return from 52% to 5%. They also let you try hundreds of
+parameter combinations and show you the best one, which looks good even if the
+strategy is worthless, and they measure it on the same data used to pick the
+settings. When I split the data instead, the settings that scored best on the
+first half (+81%) returned +32% on the second half, while the worst ones
+(&minus;18%) returned +21%.</p>
+
+<p>To combat this, I want to build a web app that does the testing properly and
+reports one verdict, either Robust, Weak, or Overfit, instead of a return
+number. A strategy that passes can then be started in paper trading, which runs
+on live prices with fake money.</p>
+
+<h2>2. Goals</h2>
+
+<ul>
+  <li>Build a backtest engine in Python with commission, slippage, stop losses
+      and position sizing.</li>
+  <li>Check it against TradingView by running the same strategies through
+      both.</li>
+  <li>Turn the statistical checks into a component that outputs one verdict.</li>
+  <li>Build a web app that goes from picking a market to running paper trading,
+      first on crypto and then US stocks.</li>
+  <li>Add a classifier that filters strategies by market condition.</li>
+</ul>
+
+<h2>3. Design</h2>
+
+<ol>
+  <li>Ask the user for a market, a holding time and how much risk they will
+      take.</li>
+  <li>Pick a strategy from the library and generate a range of settings, or let
+      the user describe their own strategy in text.</li>
+  <li>Download and cache the price history, then split it: an earlier part to
+      pick settings, a later part to score them.</li>
+  <li>Simulate every combination over the same dates, charging commission and
+      slippage on each trade.</li>
+  <li>Rank on the later part only, adjust for how many were tried, and report a
+      verdict.</li>
+</ol>
+
+<figure>
+<svg viewBox="0 22 1034 180" role="img" aria-label="System overview diagram">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#101010"/>
+    </marker>
+    <marker id="ahd" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#6b6b6b"/>
+    </marker>
+    <style>
+      .bx  { fill:#fff; stroke:#101010; stroke-width:1.3; }
+      .bxi { fill:#e9e6df; stroke:#101010; stroke-width:1.3; }
+      .bxa { fill:#efedE8; stroke:#101010; stroke-width:1.3; }
+      .bxo { fill:#fff; stroke:#6b6b6b; stroke-width:1.1; stroke-dasharray:4 3; }
+      .t   { font-family:Georgia,serif; font-size:15px; fill:#101010; text-anchor:middle; }
+      .ts  { font-family:Georgia,serif; font-size:13px; fill:#4a4a4a; text-anchor:middle; }
+      .to  { font-family:Georgia,serif; font-size:13px; fill:#6b6b6b; text-anchor:middle; }
+      .ar  { stroke:#101010; stroke-width:1.3; fill:none; marker-end:url(#ah); }
+      .ard { stroke:#6b6b6b; stroke-width:1.1; fill:none; stroke-dasharray:4 3; marker-end:url(#ahd); }
+    </style>
+  </defs>
+
+  <rect class="bxi" x="8"   y="58" width="130" height="58" rx="3"/>
+  <text class="t"   x="73"  y="82">User Input</text>
+  <text class="ts"  x="73"  y="100">market, risk</text>
+
+  <rect class="bx"  x="156" y="58" width="130" height="58" rx="3"/>
+  <text class="t"   x="221" y="82">Price</text>
+  <text class="t"   x="221" y="100">Data</text>
+
+  <rect class="bx"  x="304" y="58" width="130" height="58" rx="3"/>
+  <text class="t"   x="369" y="82">Strategy</text>
+  <text class="t"   x="369" y="100">Library</text>
+
+  <rect class="bx"  x="452" y="58" width="130" height="58" rx="3"/>
+  <text class="t"   x="517" y="82">Backtest</text>
+  <text class="t"   x="517" y="100">Engine</text>
+
+  <rect class="bxa" x="600" y="58" width="130" height="58" rx="3"/>
+  <text class="t"   x="665" y="82">Verdict</text>
+  <text class="t"   x="665" y="100">Engine</text>
+
+  <rect class="bx"  x="748" y="58" width="130" height="58" rx="3"/>
+  <text class="t"   x="813" y="82">Paper</text>
+  <text class="t"   x="813" y="100">Trading</text>
+
+  <rect class="bx"  x="896" y="58" width="130" height="58" rx="3"/>
+  <text class="t"   x="961" y="82">Live</text>
+  <text class="ts"  x="961" y="100">optional</text>
+
+  <path class="ar" d="M 138 87 L 154 87"/>
+  <path class="ar" d="M 286 87 L 302 87"/>
+  <path class="ar" d="M 434 87 L 450 87"/>
+  <path class="ar" d="M 582 87 L 598 87"/>
+  <path class="ar" d="M 730 87 L 746 87"/>
+  <path class="ar" d="M 878 87 L 894 87"/>
+
+  <rect class="bx" x="156" y="150" width="130" height="46" rx="3"/>
+  <text class="ts" x="221" y="168">Market-data</text>
+  <text class="ts" x="221" y="185">APIs</text>
+  <path class="ar" d="M 221 148 L 221 118"/>
+
+  <rect class="bxo" x="431" y="150" width="172" height="46" rx="3"/>
+  <text class="to"  x="517" y="168">TradingView</text>
+  <text class="to"  x="517" y="185">checks the results</text>
+  <path class="ard" d="M 517 118 L 517 148"/>
+
+  <path class="ard" d="M 665 56 L 665 40 L 369 40 L 369 56"/>
+  <text class="to"  x="517" y="35">rejected, try a different strategy</text>
+</svg>
+<figcaption><span class="lbl">Figure 1:</span> The web app's backend pipeline.</figcaption>
+</figure>
+
+<p class="newpage"><strong>Inputs:</strong> the user's market, holding time and risk, a strategy
+from the library or written by the user, and price history with a cost
+model.</p>
+
+<p><strong>Outputs:</strong> a ranked short list of settings, each with a verdict
+and a one-sentence reason, plus a paper-trading session for the chosen one.</p>
+
+<h2>4. Prior Work</h2>
+
+<p>Brock et al. [1] is the standard reference for testing simple trading rules.
+Sullivan et al. [2] retested it against a far larger set of rules: the
+performance survived a century of data, but vanished over the following decade,
+which is the argument for scoring on a period the settings were not chosen on.
+Bailey et al. [3] call the general problem backtest overfitting, Harvey and Liu
+[4] give a way to discount a result by how many settings were tried, and Arnott
+et al. [5] collect the fixes into a checklist done by hand. TradingView, Backtrader and QuantConnect leave that checklist to the
+user; my project runs it automatically.</p>
+
+<h2>5. Technical Approach</h2>
+
+<ul>
+  <li>Python backend, vectorized simulation over cached data, results in SQLite
+      so a long run can be stopped and resumed. Next.js frontend on a REST API,
+      with a cloud-hosted model called through OpenRouter to turn a strategy
+      written in plain text into settings the engine can run.</li>
+  <li>Trading execution runs in its own process, so a bug in the research code
+      cannot place an order. Automated tests cover the engine.</li>
+</ul>
+
+<h2>6. Timeline</h2>
+
+<table>
+  <thead>
+    <tr><th>Weeks</th><th>Focus</th><th>Deliverable</th></tr>
+  </thead>
+  <tbody>
+    <tr><td class="wk">1&ndash;4</td>
+        <td>Price data, backtest engine, verdict engine.</td>
+        <td>Reusable local datasets, backtest engine, verdict engine.</td></tr>
+    <tr><td class="wk">5&ndash;8</td>
+        <td>Start the web app and the UI that takes user input, hooked up to the
+            backtest and verdict engines.</td>
+        <td>Working web app end to end.</td></tr>
+    <tr><td class="wk">9&ndash;12</td>
+        <td>Live paper trading and deployment.</td>
+        <td>Web app pipeline extended with paper trading.</td></tr>
+    <tr><td class="wk">13&ndash;14</td>
+        <td>Testing and final touches.</td>
+        <td>Final report and demo.</td></tr>
+  </tbody>
+</table>
+
+<h2>7. References</h2>
+
+<ol class="refs">
+  <li>Brock, W., Lakonishok, J., &amp; LeBaron, B. (1992). Simple Technical
+      Trading Rules and the Stochastic Properties of Stock Returns.
+      <em>Journal of Finance</em>, 47(5), 1731&ndash;1764.
+      <a href="https://finance.martinsewell.com/stylized-facts/dependence/BrockLakonishokLeBaron1992.pdf">PDF: finance.martinsewell.com</a> (scan)</li>
+  <li>Sullivan, R., Timmermann, A., &amp; White, H. (1999). Data-Snooping,
+      Technical Trading Rule Performance, and the Bootstrap.
+      <em>Journal of Finance</em>, 54(5), 1647&ndash;1691.
+      <a href="https://eprints.lse.ac.uk/119144/1/dp303.pdf">PDF: eprints.lse.ac.uk</a> (working paper)</li>
+  <li>Bailey, D. H., Borwein, J. M., L&oacute;pez de Prado, M., &amp; Zhu, Q. J.
+      (2014). Pseudo-Mathematics and Financial Charlatanism.
+      <em>Notices of the AMS</em>, 61(5), 458&ndash;471.
+      <a href="https://www.ams.org/notices/201405/rnoti-p458.pdf">PDF: ams.org</a></li>
+  <li>Harvey, C. R., &amp; Liu, Y. (2015). Backtesting.
+      <em>Journal of Portfolio Management</em>, 42(1), 13&ndash;28.
+      <a href="https://people.duke.edu/~charvey/Research/Published_Papers/P120_Backtesting.PDF">PDF: people.duke.edu</a></li>
+  <li>Arnott, R. D., Harvey, C. R., &amp; Markowitz, H. (2019). A Backtesting
+      Protocol in the Era of Machine Learning. <em>Journal of Financial Data
+      Science</em>, 1(1), 64&ndash;74.
+      <a href="https://people.duke.edu/~charvey/Research/Published_Papers/P138_A_backtesting_protocol.pdf">PDF: people.duke.edu</a></li>
+  <li>Docs: <a href="https://docs.ccxt.com">docs.ccxt.com</a>,
+      <a href="https://docs.alpaca.markets">docs.alpaca.markets</a>,
+      <a href="https://www.tradingview.com/pine-script-reference/v6/">tradingview.com/pine-script-reference/v6</a>,
+      <a href="https://openrouter.ai/docs">openrouter.ai/docs</a></li>
+</ol>
+
+</main>
+
+<script>
+  (function () {
+    var PAGE = 11 * 96, MARGIN = 1 * 96, USABLE = PAGE - 2 * MARGIN;
+
+    function draw() {
+      var main = document.querySelector('main');
+      Array.prototype.forEach.call(
+        main.querySelectorAll('.pagebreak'), function (n) { n.remove(); });
+
+      var content = main.scrollHeight - 2 * MARGIN;
+      var pages = Math.max(1, Math.ceil(content / USABLE));
+
+      for (var k = 1; k < pages; k++) {
+        var d = document.createElement('div');
+        d.className = 'pagebreak';
+        d.style.top = (MARGIN + k * USABLE) + 'px';
+        d.innerHTML = '<span>page ' + k + ' ends</span>';
+        main.appendChild(d);
+      }
+
+      var last = ((content - (pages - 1) * USABLE) / USABLE * 100).toFixed(0);
+      document.getElementById('pagecount').textContent =
+        pages + ' page' + (pages === 1 ? '' : 's') +
+        ' at US Letter with 1in margins (last page ' + last + '% full). ' +
+        'Red dashed lines are page boundaries and do not print.';
+    }
+
+    draw();
+    window.addEventListener('resize', draw);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(draw);
+  })();
+</script>
