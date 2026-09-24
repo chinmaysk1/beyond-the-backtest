@@ -160,8 +160,6 @@ input { font: inherit; color: inherit; }
   height: 100%;
   display: flex;
   flex-direction: column;
-  opacity: 1;
-  transition: opacity 0.4s var(--ease);
 }
 .app.pending { opacity: 0; }
 

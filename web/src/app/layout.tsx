@@ -1,7 +1,8 @@
 import type { Metadata } from 'next';
-import { Poppins } from 'next/font/google';
+import { Poppins, Sora, Unbounded } from 'next/font/google';
 
 import './globals.css';
+import './experience.css';
 
 /* A geometric sans with a SINGLE-STOREY 'a' and circular bowls, matching the
  * reference. Inter was the wrong call: its 'a' is double-storey, which is the
@@ -17,6 +18,22 @@ const display = Poppins({
   variable: '--font-display',
 });
 
+/* The landing wordmark: a thin, wide geometric face, set in spaced capitals. */
+const wordmark = Sora({
+  subsets: ['latin'],
+  weight: ['200', '400'],
+  display: 'swap',
+  variable: '--font-wordmark',
+});
+
+/* Display numerals and headings on the Strategies results page. */
+const headline = Unbounded({
+  subsets: ['latin'],
+  weight: ['300', '400'],
+  display: 'swap',
+  variable: '--font-headline',
+});
+
 export const metadata: Metadata = {
   title: 'Beyond the Backtest',
   description: 'Guided strategy discovery and validation',
@@ -24,7 +41,7 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className={display.variable}>
+    <html lang="en" className={`${display.variable} ${wordmark.variable} ${headline.variable}`}>
       <body>{children}</body>
     </html>
   );

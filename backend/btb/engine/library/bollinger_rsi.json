@@ -1,0 +1,24 @@
+{
+  "name": "bollinger_rsi",
+  "title": "Bollinger + RSI reversion",
+  "description": "Buy when price closes below the lower band while RSI is oversold, sell the mirror image; exit at the middle band.",
+  "style": "mean-reversion",
+  "timeframes": ["1h", "4h", "1d"],
+  "indicators": {
+    "upper": {"fn": "bbands", "src": "close", "len": "$len", "mult": "$mult", "out": "upper"},
+    "mid": {"fn": "bbands", "src": "close", "len": "$len", "mult": "$mult", "out": "mid"},
+    "lower": {"fn": "bbands", "src": "close", "len": "$len", "mult": "$mult", "out": "lower"},
+    "rsi": {"fn": "rsi", "src": "close", "len": "$rsi_len"}
+  },
+  "entry_long": {"all": [{"lt": ["close", "lower"]}, {"lt": ["rsi", "$rsi_low"]}]},
+  "entry_short": {"all": [{"gt": ["close", "upper"]},
+                          {"gt": ["rsi", {"fn": "sub", "a": 100, "b": "$rsi_low"}]}]},
+  "exit_long": {"gte": ["close", "mid"]},
+  "exit_short": {"lte": ["close", "mid"]},
+  "stop": {"kind": "pct", "value": "$stop_pct"},
+  "defaults": {"len": 20, "mult": 2.0, "rsi_len": 14, "rsi_low": 30, "stop_pct": 5},
+  "grid": {"len": [20, 50], "mult": [2.0, 2.5], "rsi_low": [25, 30, 35], "stop_pct": [0, 5]},
+  "labels": {"len": "Band length", "mult": "Band width (standard deviations)",
+             "rsi_len": "RSI length", "rsi_low": "Oversold level (overbought is 100 minus this)",
+             "stop_pct": "Stop loss %"}
+}

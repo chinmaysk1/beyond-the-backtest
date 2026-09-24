@@ -155,10 +155,11 @@ and was unusable: a permanent render loop repainting ~60×/sec, plus blur and 3D
 transforms forcing the compositor to re-rasterize layers every frame. Everything
 now paints once per change — data, resize, crosshair, pan — and then stops.
 
-Three.js was evaluated and dropped. The depth effect it bought did not justify
-the bundle, the GPU cost, or react-three-fiber in the build. The receding
-window-less look is a per-candle alpha ramp in the canvas instead, which costs
-nothing and lets the series fade behind the panel.
+Three.js was evaluated and dropped *for the chart*. The depth effect it bought
+did not justify the bundle, the GPU cost, or react-three-fiber in the build.
+The receding window-less look is a per-candle alpha ramp in the canvas instead,
+which costs nothing and lets the series fade behind the panel. (It is used on
+the landing, under strict limits; see below.)
 
 Panel translucency is **alpha only** (`rgba(23,26,30,0.78)`), no blur, so the
 candles tint the surface they pass under without touching the compositor.
@@ -206,11 +207,64 @@ state.
 
 ---
 
+## Landing and the transition into the app
+
+Every visit opens on a landing: a dark space scene, the wordmark, and five
+cards, one per section. Choosing one flies the five cards into the nav tabs and
+the wordmark into the brand, while the section rises from below. The brand, or
+Esc, plays it in reverse.
+
+- **`SpaceScene.tsx` is the one continuous render loop in the app.** It uses
+  three.js (plain, no react-three-fiber), is loaded with `next/dynamic` so it is
+  its own chunk, runs only while the landing is on screen, stops outright once
+  a section is entered, pauses on a hidden tab, and honours
+  `prefers-reduced-motion`. The no-rAF-loop rule for the working screens stands.
+- **Dark and quiet by design:** low-opacity stars, dim candles, faint lines. It
+  is a backdrop for the wordmark, not the subject.
+- **`lib/flight.ts`** does the card-to-tab flight with throwaway clones and the
+  Web Animations API. Cards and tabs live in different parts of the tree, so a
+  clone that starts as one and ends as the other is what makes them read as
+  the same object.
+- Styles for all of this, and for the Strategies flow, are in
+  `src/app/experience.css`, apart from the Data tab's `globals.css`.
+
+## Strategies (Weeks 2–3)
+
+One flow in three phases, each crossfading into the next:
+
+1. **Setup** — a single centred panel: market (searchable), timeframe,
+   strategy (library, or your own JSON), costs. Every timeframe is always
+   shown; one a market lacks is disabled with the reason (Yahoo serves no 4h
+   for stocks). Custom JSON comes with a copyable prompt for ChatGPT or Claude,
+   and is checked as you paste.
+2. **Running** — the backtest and its sweep, with live progress from the
+   worker.
+3. **Results** — a page rather than a stack of boxes: the test-window return
+   against buy-and-hold with a plain-English sentence; Train / Test / Train+test;
+   the equity curve (it draws in once, then stops); the best settings with
+   train rank beside each, plus a **rank scatter** of every combination
+   (train rank against test rank); trades; the costs paid.
+
+**Run backtest always queues the sweep too.** Finding the best settings is not
+a separate decision to know to make, and a best-settings list without the
+train/test comparison beside it is the misleading number this product exists
+to replace. "Use" on a row re-runs the backtest with those settings.
+
+| Route | Does |
+|---|---|
+| `GET /api/strategies` | Newest version of each library strategy |
+| `POST /api/backtests` | `{kind, withSweep, strategy \| spec, symbol, timeframe, costs?, params?}`. Validates market, strategy, settings, cost bounds; a pasted `spec` is checked (`lib/specCheck.ts`), stored as a strategies row owned by the user (deduplicated by hash), and referenced by id. At most 4 open jobs per user. |
+| `GET /api/backtests/[id]` | Status and progress; once done, the result, plus the full run's trades and curve for a backtest. Owner only. |
+
+`lib/specCheck.ts` mirrors the engine's validator for instant feedback. It is
+not the authority: the worker re-validates every spec with the full rules
+before running it, and returns its exact error if it fails. Sweeps are capped
+at 500 combinations in both places.
+
 ## Not built yet
 
-- **Strategies, Sweeps, Results, Paper trading** — shown disabled in the nav so
-  the product shape reads. Contents land in Weeks 6–13.
-- **Job enqueueing.** The `jobs` table exists; nothing writes to it yet.
+- **Sweeps, Results, Paper trading** — each opens a plain "arrives in weeks
+  N–M" screen, so the product's shape reads without faking what isn't built.
 - **Deployment.** Runs locally against the tunnel. Production needs the app
   containerised beside Postgres on the Docker network, Caddy for TLS on :80/:443
   (both free on the box), and a domain.

@@ -1,0 +1,19 @@
+{
+  "name": "rsi_recovery",
+  "title": "RSI recovery",
+  "description": "Buy when RSI climbs back up out of oversold territory; sell once it recovers or after a fixed number of bars.",
+  "style": "mean-reversion",
+  "timeframes": ["4h", "1d"],
+  "indicators": {
+    "rsi": {"fn": "rsi", "src": "close", "len": "$rsi_len"}
+  },
+  "entry_long": {"cross_above": ["rsi", "$level"]},
+  "exit_long": {"gt": ["rsi", "$exit_level"]},
+  "stop": {"kind": "pct", "value": "$stop_pct"},
+  "max_bars": "$max_bars",
+  "defaults": {"rsi_len": 14, "level": 30, "exit_level": 60, "stop_pct": 8, "max_bars": 30},
+  "grid": {"rsi_len": [7, 14], "level": [25, 30, 35], "exit_level": [50, 60, 70]},
+  "labels": {"rsi_len": "RSI length", "level": "Oversold level", "exit_level": "Exit level",
+             "stop_pct": "Stop loss %", "max_bars": "Maximum bars held"},
+  "constraints": ["level < exit_level"]
+}

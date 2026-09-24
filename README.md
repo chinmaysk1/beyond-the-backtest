@@ -155,8 +155,68 @@ warning, but nothing should be concluded from them. Fixing it needs Alpaca
 (free key, minute data back to 2016), which the proposal already names for
 paper trading.
 
+## Status — Weeks 2–3, the backtest engine and the Strategies experience
+
+`backend/btb/engine/`. A strategy is a JSON spec, never code; the engine turns
+it into trades with costs, stops and sizing inside the fill model, and records
+every run with the `as_of` and spec hash that reproduce it.
+
+```bash
+python -m btb.engine library --sync        # validate the built-in specs, load into DB
+python -m btb.engine run   --strategy ema_cross_adx --symbol BTC/USD --timeframe 4h
+python -m btb.engine sweep --strategy ema_cross_adx --symbol BTC/USD --timeframe 4h
+python -m btb.engine worker                # claim jobs; refresh stale data when idle
+python -m btb.engine schema                # the spec's JSON Schema (what an AI writes to)
+python -m btb.engine run ... --csv FILE    # fully offline, no database
+```
+
+| Module | Does |
+|---|---|
+| `spec.py` | The spec language: composable primitives (sources, arithmetic, series ops, averages, Pine-exact named indicators, higher-timeframe nodes, conditions). Validates with exact error paths; generates its own JSON Schema. |
+| `indicators.py`, `timeframes.py` | The maths. Wilder smoothing where Pine uses it; higher timeframes grouped by wall-clock bucket and shifted one bar. |
+| `fills.py`, `metrics.py` | The position loop and the numbers. |
+| `windows.py`, `jobs.py`, `worker.py` | Train/test/holdout from bars actually held; backtest and sweep jobs; the queue worker. |
+| `refresh.py` | Keeps stored series current. Runs in the worker whenever the queue is empty. |
+
+**Parity is the gate.** `tests/reference_engine.py` is the earlier prototype's
+pure-Python loop, which was reconciled bar by bar against TradingView. The
+engine reproduces its trades *exactly* — every entry and exit on the same bar at
+the same price, 199 trades on 14 years of BTC 4h — in
+`tests/test_engine_parity.py`.
+
+The engine deliberately differs from it in three ways. Each one is an option,
+and the parity test turns all three off:
+
+- **A stop the bar gaps through fills at the open**, not at the stop.
+- **An open position at the end is closed and counted.** The reference drops it
+  from the stats.
+- **An account that would go below zero is liquidated.** The reference only
+  checks at exits, so an unstopped short through BTC's 2013 rally sat at −160%
+  mid-trade and kept going.
+
+**A sweep ranks on the test window, never on train**, and reports train rank
+beside it plus the train/test rank correlation across the whole grid. On the
+live strategy's grid that correlation is 0.32, and the #1 test setting ranked
+#13 on train: the in-sample-rank problem the proposal describes, measured. It
+runs a fixed grid rather than an optimiser, so the number of configurations
+tried (N) is known exactly, which the verdict engine needs. 162 runs take 1.5 s.
+
+**Data now refreshes itself.** When a series' next bar is due, the worker's idle
+loop fetches it through `ingest_series`, the same audited path as a backfill.
+It asks at most every 5 minutes, and only once per bar period when a market is
+closed.
+
+**The web app got a front door and a real Strategies tab.** Every visit opens
+on a dark 3D landing; choosing a section flies its card into the nav and raises
+the section from below. Strategies is one flow: pick a market, timeframe and
+strategy (from the library, or your own JSON, written with the copyable AI
+prompt and checked as you paste), run it, and read a results page built around
+the test-window return, the equity curve, the best settings with their train
+rank, and a scatter of every combination's train rank against its test rank.
+Running a backtest always runs its sweep too. Details in `web/PLAN.md`.
+
 ## Next
 
-Weeks 3–5: the strategy-spec compiler and the vectorised backtest engine —
-explicit costs, stops, position sizing, and the multi-timeframe shift that makes
-higher-timeframe lookahead structurally impossible.
+Week 4: the verdict engine. Probability of backtest overfitting, a deflated
+statistic using the sweep's recorded N, regime segmentation, and the
+ROBUST / WEAK / OVERFIT label that replaces "unverified" on the leaderboard.

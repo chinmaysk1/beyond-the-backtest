@@ -1,0 +1,19 @@
+{
+  "name": "ema_cross",
+  "title": "EMA cross",
+  "description": "Go long when a fast moving average crosses above a slow one, short when it crosses below.",
+  "style": "trend",
+  "timeframes": ["4h", "1d"],
+  "indicators": {
+    "fast": {"fn": "ema", "src": "close", "len": "$fast"},
+    "slow": {"fn": "ema", "src": "close", "len": "$slow"}
+  },
+  "entry_long": {"cross_above": ["fast", "slow"]},
+  "entry_short": {"cross_below": ["fast", "slow"]},
+  "exit_long": {"cross_below": ["fast", "slow"]},
+  "exit_short": {"cross_above": ["fast", "slow"]},
+  "defaults": {"fast": 20, "slow": 100},
+  "grid": {"fast": [10, 20, 50], "slow": [50, 100, 200]},
+  "labels": {"fast": "Fast EMA length", "slow": "Slow EMA length"},
+  "constraints": ["fast < slow"]
+}

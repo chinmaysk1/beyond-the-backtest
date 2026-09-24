@@ -1,0 +1,18 @@
+{
+  "name": "supertrend_trend",
+  "title": "Supertrend with trend filter",
+  "description": "Follow Supertrend flips, but only in the direction of a long moving average.",
+  "style": "trend",
+  "timeframes": ["4h", "1d"],
+  "indicators": {
+    "dir": {"fn": "supertrend", "atr_len": "$atr_len", "mult": "$mult", "out": "dir"},
+    "trend": {"fn": "ema", "src": "close", "len": "$trend_len"}
+  },
+  "entry_long": {"all": [{"cross_above": ["dir", 0]}, {"gt": ["close", "trend"]}]},
+  "entry_short": {"all": [{"cross_below": ["dir", 0]}, {"lt": ["close", "trend"]}]},
+  "exit_long": {"cross_below": ["dir", 0]},
+  "exit_short": {"cross_above": ["dir", 0]},
+  "defaults": {"atr_len": 10, "mult": 3.0, "trend_len": 200},
+  "grid": {"atr_len": [10, 14, 20], "mult": [2.0, 3.0, 4.0], "trend_len": [100, 200]},
+  "labels": {"atr_len": "ATR length", "mult": "ATR multiplier", "trend_len": "Trend filter length"}
+}

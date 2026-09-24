@@ -66,6 +66,10 @@ INTERVALS = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
 # returns less; recorded here so the caller can be told what it actually got.
 MAX_DAYS = {"1m": 7, "5m": 58, "15m": 58, "30m": 58, "1h": 730, "1d": None, "1w": None}
 
+class _OutOfReach(Exception):
+    """The requested window lies entirely beyond the source's history limit."""
+
+
 class EquitySource:
     name = "yahoo"
     regular = False          # nights, weekends and market holidays are not gaps
@@ -113,10 +117,19 @@ class EquitySource:
         # short series. Clamp to what the endpoint will grant and record how
         # much was actually asked for, so a thin intraday series is visibly
         # thin rather than mysteriously absent.
+        #
+        # The limit is measured back from NOW, not from `end`. Measuring it from
+        # `end` broke every incremental ingest after the first: the "backfill
+        # the front" fetch ends at the oldest stored bar (~725 days ago for 1h),
+        # so the clamp put period1 ~1,455 days back and Yahoo answered 422 --
+        # for every equity intraday series, from the day after the first build.
         cap = MAX_DAYS.get(timeframe)
         if cap is not None:
-            floor = end - cap * 86400
+            floor = int(time.time()) - cap * 86400
             self.clamped_days = cap
+            if end <= floor:
+                raise _OutOfReach(f"{symbol} {timeframe}: window ends before Yahoo's "
+                                  f"{cap}-day intraday limit")
             if start < floor:
                 start = floor
 
@@ -132,7 +145,13 @@ class EquitySource:
     # -- Source protocol ------------------------------------------------------
 
     def fetch(self, symbol: str, timeframe: str, *, since=None, until=None) -> pd.DataFrame:
-        r = self._raw(symbol, timeframe, since, until)
+        try:
+            r = self._raw(symbol, timeframe, since, until)
+        except _OutOfReach:
+            # Nothing Yahoo can serve lies in that window. That is an empty
+            # answer, not an error -- and it must not overwrite the metadata and
+            # events cached by this source's real fetch.
+            return empty_frame()
         self._meta[symbol] = r.get("meta", {})
 
         stamps = r.get("timestamp") or []

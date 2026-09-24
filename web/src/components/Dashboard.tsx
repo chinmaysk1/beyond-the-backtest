@@ -4,11 +4,16 @@ import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import type { Bar } from '../lib/adjust';
+import { flyCards, flyTitle } from '../lib/flight';
+import { ROOMS, type RoomId } from '../lib/rooms';
 import type { AdjustMode, Market } from '../lib/types';
 
 import Brand from './Brand';
 import CandleChart from './CandleChart';
+import Landing, { type Stage } from './Landing';
 import MarketList from './MarketList';
+import SoonView from './SoonView';
+import StrategiesView, { loadLibrary } from './StrategiesView';
 
 /* Bars per request. Large enough that the first screen is never short, small
  * enough that switching symbols is instant on a 315,000-bar series. */
@@ -33,6 +38,52 @@ export default function Dashboard({ username }: { username: string }) {
   const [hovered, setHovered] = useState<Bar | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [tab, setTab] = useState<RoomId>('data');
+
+  /* -- landing <-> app ------------------------------------------------------
+   *
+   * Every visit opens on the landing. Choosing a room flies the five cards
+   * into the nav tabs and the wordmark into the brand, while the room rises
+   * from below; the brand (or Esc) plays it backwards. See lib/flight.ts. */
+  const [stage, setStage] = useState<Stage>('landing');
+  const cardsRef = useRef<HTMLButtonElement[]>([]);
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  const tabsRef = useRef<HTMLButtonElement[]>([]);
+  const brandRef = useRef<HTMLElement>(null);
+
+  const enter = useCallback(async (room: RoomId) => {
+    if (stage !== 'landing') return;
+    setTab(room);
+    setStage('entering');
+    const labels = ROOMS.map((r) => r.title);
+    await Promise.all([
+      flyCards(cardsRef.current, tabsRef.current, labels, ROOMS.findIndex((r) => r.id === room)),
+      titleRef.current && brandRef.current ? flyTitle(titleRef.current, brandRef.current) : null,
+    ]);
+    setStage('app');
+  }, [stage]);
+
+  const home = useCallback(async () => {
+    if (stage !== 'app') return;
+    setStage('leaving');
+    const labels = ROOMS.map((r) => r.title);
+    await Promise.all([
+      flyCards(cardsRef.current, tabsRef.current, labels, ROOMS.findIndex((r) => r.id === tab), true),
+      titleRef.current && brandRef.current ? flyTitle(titleRef.current, brandRef.current, true) : null,
+    ]);
+    setStage('landing');
+  }, [stage, tab]);
+
+  // Warm the strategy library while the landing is up (see loadLibrary).
+  useEffect(() => { loadLibrary().catch(() => {}); }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !(e.target as HTMLElement).matches('input, textarea, select')) home();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [home]);
 
   const active = useMemo(
     () => markets.find((m) => m.symbol === symbol) ?? null,
@@ -167,16 +218,24 @@ export default function Dashboard({ username }: { username: string }) {
   const shown = hovered ?? bars[bars.length - 1] ?? null;
 
   return (
-    <div className="app">
+    <>
+    <Landing stage={stage} onChoose={enter} cardsRef={cardsRef} titleRef={titleRef} />
+    <div className={`app stage-${stage}`}>
       <nav className="nav">
-        <Brand />
+        <Brand onClick={home} wordRef={brandRef} />
 
         <div className="tabs">
-          <button className="on" type="button">Data</button>
-          <button disabled type="button">Strategies</button>
-          <button disabled type="button">Sweeps</button>
-          <button disabled type="button">Results</button>
-          <button disabled type="button">Paper trading</button>
+          {ROOMS.map((r, i) => (
+            <button
+              key={r.id}
+              ref={(el) => { if (el) tabsRef.current[i] = el; }}
+              className={tab === r.id ? 'on' : ''}
+              type="button"
+              onClick={() => setTab(r.id)}
+            >
+              {r.title}{!r.live && <span className="soon-dot" />}
+            </button>
+          ))}
         </div>
 
         <div className="nav-right">
@@ -196,6 +255,9 @@ export default function Dashboard({ username }: { username: string }) {
         </div>
       </nav>
 
+      <div className="stage">
+      {tab === 'strategies' ? <StrategiesView markets={markets} />
+        : tab !== 'data' ? <SoonView room={tab} /> : (<>
       <div className="head">
         <div className="title">
           <h1>{symbol ?? 'â€”'}</h1>
@@ -268,7 +330,10 @@ export default function Dashboard({ username }: { username: string }) {
           {scale === 'log' ? 'LOG' : 'LINEAR'}
         </button>
       </div>
+      </>)}
+      </div>
     </div>
+    </>
   );
 }
 
