@@ -49,8 +49,12 @@ model jobs {
   finished_at DateTime? @db.Timestamptz(6)
   error       String?
   created_at  DateTime  @default(now()) @db.Timestamptz(6)
+  result      Json?
+  progress    Float?    @db.Real
   users       users?    @relation(fields: [user_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
   runs        runs[]
+
+  @@index([user_id, status], map: "jobs_user_status")
 }
 
 /// This model contains an expression index which requires additional setup for migrations. Visit https://pris.ly/d/expression-indexes for more info.
@@ -67,10 +71,14 @@ model runs {
   split        String?
   metrics      Json
   created_at   DateTime    @default(now()) @db.Timestamptz(6)
+  config       Json        @default("{}")
+  trades       Json?
+  equity       Json?
   jobs         jobs?       @relation(fields: [job_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
   strategies   strategies? @relation(fields: [strategy_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
   @@index([strategy_id, symbol, timeframe, split], map: "runs_lookup")
+  @@index([job_id], map: "runs_job")
 }
 
 model series {
@@ -100,6 +108,8 @@ model strategies {
   created_at DateTime @default(now()) @db.Timestamptz(6)
   runs       runs[]
   users      users?   @relation(fields: [user_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([name, created_at(sort: Desc)], map: "strategies_name")
 }
 
 model universe {
@@ -122,3 +132,5 @@ model users {
   jobs          jobs[]
   strategies    strategies[]
 }
+
+

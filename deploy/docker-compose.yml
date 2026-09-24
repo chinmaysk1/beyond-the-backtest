@@ -45,8 +45,9 @@ services:
       timeout: 5s
       retries: 5
 
-  # The Python worker. Currently used for data ingestion; from Weeks 3-5 it also
-  # claims sweep jobs from the `jobs` table.
+  # The Python worker. Claims backtest and sweep jobs from the `jobs` table
+  # (FOR UPDATE SKIP LOCKED), and when the queue is empty refreshes any stored
+  # series with a newly closed bar -- which is what keeps the data current.
   #
   # One core, not two. The box's other services are idle, but pinning both cores
   # makes open-webui visibly laggy for the duration of a sweep -- and a sweep
@@ -68,7 +69,7 @@ services:
       TZ: UTC
     cpus: 1.0
     mem_limit: 2g
-    command: ["btb.data", "list"]
+    command: ["btb.engine", "worker"]
 
 volumes:
   pgdata:

@@ -1,0 +1,37 @@
+{
+  "name": "ema_cross_adx",
+  "title": "EMA cross, trend-filtered",
+  "description": "Trade EMA crossovers only when ADX says a trend is present, on this timeframe and on one three times longer.",
+  "style": "trend",
+  "timeframes": ["4h", "1h", "1d"],
+  "indicators": {
+    "fast": {"fn": "ema", "src": "close", "len": "$fast"},
+    "slow": {"fn": "ema", "src": "close", "len": "$slow"},
+    "adx": {"fn": "adx", "len": "$adx_len"},
+    "adx_htf": {"fn": "adx", "len": "$adx_len", "tf_mult": 3}
+  },
+  "entry_long": {"all": [
+    {"cross_above": ["fast", "slow"]},
+    {"gte": ["adx_htf", "$adx_min"]},
+    {"gte": ["adx", "$adx_min_ltf"]}
+  ]},
+  "entry_short": {"all": [
+    {"cross_below": ["fast", "slow"]},
+    {"gte": ["adx_htf", "$adx_min"]},
+    {"gte": ["adx", "$adx_min_ltf"]}
+  ]},
+  "exit_long": {"cross_below": ["fast", "slow"]},
+  "exit_short": {"cross_above": ["fast", "slow"]},
+  "stop": {"kind": "pct", "value": "$stop_pct"},
+  "defaults": {"fast": 20, "slow": 62, "adx_len": 9, "adx_min": 23, "adx_min_ltf": 28, "stop_pct": 4.1},
+  "grid": {"fast": [10, 20, 30], "slow": [50, 62, 100], "adx_min": [18, 23, 28], "stop_pct": [0, 3, 5]},
+  "labels": {
+    "fast": "Fast EMA length",
+    "slow": "Slow EMA length",
+    "adx_len": "ADX length",
+    "adx_min": "Minimum trend strength (longer timeframe)",
+    "adx_min_ltf": "Minimum trend strength (this timeframe)",
+    "stop_pct": "Stop loss %"
+  },
+  "constraints": ["fast < slow"]
+}

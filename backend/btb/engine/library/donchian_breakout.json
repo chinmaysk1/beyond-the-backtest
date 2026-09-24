@@ -1,0 +1,21 @@
+{
+  "name": "donchian_breakout",
+  "title": "Donchian breakout",
+  "description": "Buy a break above the highest high of the last N bars; sell a break below the lowest low. Exit on a shorter opposite channel.",
+  "style": "breakout",
+  "timeframes": ["4h", "1d"],
+  "indicators": {
+    "upper": {"fn": "shift", "src": {"fn": "highest", "src": "high", "len": "$len"}, "n": 1},
+    "lower": {"fn": "shift", "src": {"fn": "lowest", "src": "low", "len": "$len"}, "n": 1},
+    "exit_upper": {"fn": "shift", "src": {"fn": "highest", "src": "high", "len": "$exit_len"}, "n": 1},
+    "exit_lower": {"fn": "shift", "src": {"fn": "lowest", "src": "low", "len": "$exit_len"}, "n": 1}
+  },
+  "entry_long": {"gt": ["close", "upper"]},
+  "entry_short": {"lt": ["close", "lower"]},
+  "exit_long": {"lt": ["close", "exit_lower"]},
+  "exit_short": {"gt": ["close", "exit_upper"]},
+  "defaults": {"len": 55, "exit_len": 20},
+  "grid": {"len": [20, 55, 100], "exit_len": [10, 20, 50]},
+  "labels": {"len": "Breakout channel length", "exit_len": "Exit channel length"},
+  "constraints": ["exit_len < len"]
+}

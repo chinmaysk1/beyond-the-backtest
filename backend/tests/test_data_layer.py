@@ -337,3 +337,31 @@ def test_info_findings_do_not_fail_a_series():
     """INFO is a note, not a problem. It must never gate a series."""
     f = integrity.Finding("x", integrity.INFO, "note")
     assert integrity.Report([f], {"rows": 1}).ok
+
+
+def test_intraday_limit_is_measured_from_now(monkeypatch):
+    """Yahoo's intraday depth limit counts back from NOW, not from `until`.
+
+    Counting from `until` sent the "backfill the front" fetch -- which ends at
+    the oldest stored bar, ~725 days ago for 1h -- to period1 ~1,455 days back,
+    and Yahoo answered 422 for every equity intraday series on every ingest
+    after the first. A window entirely out of reach must come back empty, not
+    as an error, and without clobbering what the real fetch cached.
+    """
+    import time as _time
+    from btb.data.sources.equities import EquitySource
+
+    sent = []
+    src = EquitySource()
+    monkeypatch.setattr(src, "_get", lambda sym, params: sent.append(params) or {
+        "meta": {}, "timestamp": [], "indicators": {"quote": [{}]}})
+    now = int(_time.time())
+
+    src.fetch("SPY", "1h", since=0, until=now - 725 * 86400)
+    assert sent[-1]["period1"] >= now - 730 * 86400 - 5
+
+    src._events_cache["SPY"] = {"splits": [1], "dividends": []}   # from a real fetch
+    n = len(sent)
+    out = src.fetch("SPY", "1h", since=0, until=now - 800 * 86400)
+    assert out.empty and len(sent) == n                 # no request at all
+    assert src._events_cache["SPY"] == {"splits": [1], "dividends": []}

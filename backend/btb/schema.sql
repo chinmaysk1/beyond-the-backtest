@@ -140,7 +140,7 @@ CREATE TABLE IF NOT EXISTS strategies (
 CREATE TABLE IF NOT EXISTS jobs (
     id          bigserial PRIMARY KEY,
     user_id     uuid REFERENCES users(id),
-    kind        text NOT NULL,              -- 'sweep' | 'refresh' | 'backfill'
+    kind        text NOT NULL,              -- 'backtest' | 'sweep' | 'refresh' | 'backfill'
     payload     jsonb NOT NULL,
     status      text NOT NULL DEFAULT 'queued'
                 CHECK (status IN ('queued','running','done','failed','cancelled')),
@@ -180,6 +180,35 @@ CREATE INDEX IF NOT EXISTS runs_lookup
 
 -- Resuming a sweep depends on recognising work already done. Without this, an
 -- interrupted sweep silently re-runs everything it already has.
-CREATE UNIQUE INDEX IF NOT EXISTS runs_dedupe
+-- ---------------------------------------------------------------------------
+-- Engine (Weeks 2–3). Additive, applied with ALTER so this file stays re-runnable.
+-- ---------------------------------------------------------------------------
+
+-- What a job produced, and how far along it is. The web app polls these; a
+-- sweep reports progress as the fraction of combinations done.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS result   jsonb;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress real;
+CREATE INDEX IF NOT EXISTS jobs_user_status ON jobs (user_id, status);
+
+-- Everything besides params and window that changes a result: costs, fill
+-- model, sizing, adjustment mode. A run is not reproducible without it.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS config jsonb NOT NULL DEFAULT '{}'::jsonb;
+-- Trade list and downsampled equity curve, for runs the UI draws. NULL for
+-- sweep rows, which only need their metrics.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS trades jsonb;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS equity jsonb;
+
+-- Resuming a sweep depends on recognising work already done. Without this, an
+-- interrupted sweep silently re-runs everything it already has.
+--
+-- The key includes `config`. The Week 1 index did not, which would have made
+-- a re-run at a different commission return the old result as if it were the
+-- new one. Nothing had been written to `runs` before this, so replacing the
+-- index loses nothing.
+DROP INDEX IF EXISTS runs_dedupe;
+CREATE UNIQUE INDEX IF NOT EXISTS runs_dedupe_v2
     ON runs (strategy_id, symbol, timeframe, split, window_start, window_end,
-             md5(params::text));
+             md5(params::text), md5(config::text));
+
+CREATE INDEX IF NOT EXISTS runs_job ON runs (job_id);
+CREATE INDEX IF NOT EXISTS strategies_name ON strategies (name, created_at DESC);

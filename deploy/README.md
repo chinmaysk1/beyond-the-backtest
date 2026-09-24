@@ -45,6 +45,28 @@ The tunnel drops on idle; re-open it and carry on. Nothing running on the server
 depends on it — the backfill and the worker talk to Postgres over the Docker
 network, not through the tunnel.
 
+## Deploying the backend
+
+The box has no git checkout. `~/btb/` holds a copy of `backend/` and `deploy/`,
+shipped from a laptop and rebuilt in place:
+
+```bash
+tar --exclude=__pycache__ -czf - backend/Dockerfile backend/requirements.txt \
+    backend/universe.json backend/btb deploy \
+  | ssh ubuntu@<host> 'cd ~/btb && tar -xzf - && \
+      BTB_DB_PASSWORD="$(cat ~/btb/.pgpass)" bash deploy/up.sh'
+docker logs -f btb-worker          # on the box
+```
+
+`up.sh` rebuilds the image, re-applies the schema (idempotent), and recreates
+`btb-worker`. The worker loads the strategy library into the database on start,
+claims `backtest` and `sweep` jobs, and between jobs refreshes any series with a
+newly closed bar. A refresh gives way as soon as a job is queued, so a click in
+the web app never waits behind a data catch-up.
+
+`deploy/*.sh` must have LF line endings (`.gitattributes` enforces it). With
+CRLF, bash reads `set -o pipefail\r` and refuses to run.
+
 ## Running a backfill on the server
 
 Long ingests belong on the box, not on a laptop that gets closed:

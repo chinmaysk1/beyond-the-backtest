@@ -275,3 +275,243 @@ def stale_series(conn, grace: float = 1.5) -> list[dict]:
         if r["age"] > grace * tf_seconds(r["timeframe"]):
             out.append(r)
     return out
+
+
+# -- engine: strategies ---------------------------------------------------------
+
+def upsert_strategy(conn, strategy_id: str, name: str, spec: dict, sha: str,
+                    user_id: str | None = None) -> None:
+    """Insert a strategy version. Ids derive from (name, sha), so loading the
+    same spec twice is a no-op and an edited spec becomes a new row -- old runs
+    stay attached to the exact spec that produced them."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO strategies (id, user_id, name, spec, spec_sha) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
+            (strategy_id, user_id, name, json.dumps(spec), sha))
+
+
+def latest_strategy(conn, name: str) -> dict | None:
+    """The newest library version of a strategy (user_id IS NULL)."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT id::text AS id, name, spec, spec_sha FROM strategies "
+                    "WHERE name = %s AND user_id IS NULL "
+                    "ORDER BY created_at DESC LIMIT 1", (name,))
+        return cur.fetchone()
+
+
+def strategy_by_id(conn, strategy_id: str) -> dict | None:
+    """One strategy version by id -- how a user's own (custom) spec is found."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT id::text AS id, user_id::text AS user_id, name, spec, spec_sha "
+                    "FROM strategies WHERE id = %s", (strategy_id,))
+        return cur.fetchone()
+
+
+def universe_entry(conn, symbol: str) -> dict | None:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT symbol, source, asset_class, timeframes, active "
+                    "FROM universe WHERE symbol = %s", (symbol,))
+        return cur.fetchone()
+
+
+def series_meta(conn, symbol: str, timeframe: str) -> dict | None:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT source, symbol, timeframe, asset_class, first_ts, last_ts, "
+                    "row_count, checked_at FROM series WHERE symbol=%s AND timeframe=%s "
+                    "ORDER BY row_count DESC LIMIT 1", (symbol, timeframe))
+        return cur.fetchone()
+
+
+# -- engine: runs -----------------------------------------------------------------
+
+_RUN_KEY = """
+    strategy_id=%s AND symbol=%s AND timeframe=%s AND split=%s
+    AND window_start=%s AND window_end=%s
+    AND md5(params::text) = md5(%s::jsonb::text)
+    AND md5(config::text) = md5(%s::jsonb::text)
+"""
+
+
+def insert_run(conn, *, job_id, strategy_id, symbol, timeframe, params, window_start,
+               window_end, as_of, split, metrics, config, trades=None, equity=None
+               ) -> tuple[int, bool]:
+    """Record one evaluated configuration. Returns (run id, newly inserted).
+
+    ON CONFLICT DO NOTHING against `runs_dedupe` is what lets an interrupted
+    sweep resume: work already recorded is recognised instead of redone. The
+    key includes `config` (costs, fill model, adjustment), because two runs
+    differing only in commission are different results.
+    """
+    p, c = json.dumps(params, sort_keys=True), json.dumps(config, sort_keys=True)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO runs (job_id, strategy_id, symbol, timeframe, params,
+                              window_start, window_end, as_of, split, metrics,
+                              config, trades, equity)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT DO NOTHING
+            RETURNING id
+            """,
+            (job_id, strategy_id, symbol, timeframe, p, int(window_start),
+             int(window_end), int(as_of), split, json.dumps(metrics), c,
+             json.dumps(trades) if trades is not None else None,
+             json.dumps(equity) if equity is not None else None))
+        row = cur.fetchone()
+        if row:
+            return int(row[0]), True
+        cur.execute("SELECT id FROM runs WHERE" + _RUN_KEY,
+                    (strategy_id, symbol, timeframe, split, int(window_start),
+                     int(window_end), p, c))
+        return int(cur.fetchone()[0]), False
+
+
+def insert_runs(conn, rows: list[dict]) -> None:
+    """Batch form of insert_run for sweeps: one round trip for many rows.
+
+    Same dedupe semantics (ON CONFLICT DO NOTHING). Sweep rows carry no trades
+    or curve, and their ids are not needed, so nothing is returned.
+    """
+    if not rows:
+        return
+    with conn.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO runs (job_id, strategy_id, symbol, timeframe, params,
+                              window_start, window_end, as_of, split, metrics, config)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT DO NOTHING
+            """,
+            [(r["job_id"], r["strategy_id"], r["symbol"], r["timeframe"],
+              json.dumps(r["params"], sort_keys=True), int(r["window_start"]),
+              int(r["window_end"]), int(r["as_of"]), r["split"], json.dumps(r["metrics"]),
+              json.dumps(r["config"], sort_keys=True)) for r in rows])
+
+
+def runs_for_windows(conn, *, strategy_id, symbol, timeframe, config,
+                     windows: dict[str, tuple[int, int]]) -> dict:
+    """Every recorded run for these windows and config, keyed (split, params).
+
+    One query instead of one lookup per combination -- the difference between
+    a sweep that resumes instantly and one that spends most of its time on
+    network round trips.
+    """
+    out: dict = {}
+    with conn.cursor(row_factory=dict_row) as cur:
+        for split, (start, end) in windows.items():
+            cur.execute(
+                """
+                SELECT params, metrics FROM runs
+                WHERE strategy_id=%s AND symbol=%s AND timeframe=%s AND split=%s
+                  AND window_start=%s AND window_end=%s
+                  AND md5(config::text) = md5(%s::jsonb::text)
+                """,
+                (strategy_id, symbol, timeframe, split, int(start), int(end),
+                 json.dumps(config, sort_keys=True)))
+            for r in cur.fetchall():
+                out[(split, json.dumps(r["params"], sort_keys=True))] = r["metrics"]
+    return out
+
+
+def find_run(conn, *, strategy_id, symbol, timeframe, split, window_start,
+             window_end, params, config) -> dict | None:
+    """A previously recorded run with exactly this key, if any."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT id, metrics FROM runs WHERE" + _RUN_KEY,
+                    (strategy_id, symbol, timeframe, split, int(window_start),
+                     int(window_end), json.dumps(params, sort_keys=True),
+                     json.dumps(config, sort_keys=True)))
+        return cur.fetchone()
+
+
+# -- engine: jobs ------------------------------------------------------------------
+
+def enqueue_job(conn, kind: str, payload: dict, *, user_id=None, priority: int = 100) -> int:
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO jobs (user_id, kind, payload, priority) "
+                    "VALUES (%s, %s, %s, %s) RETURNING id",
+                    (user_id, kind, json.dumps(payload), priority))
+        return int(cur.fetchone()[0])
+
+
+def claim_job(conn, worker: str, kinds: list[str]) -> dict | None:
+    """Take the next queued job, atomically.
+
+    FOR UPDATE SKIP LOCKED means two workers polling at once each get a
+    different job, or nothing -- never the same one. Committed before
+    returning, so the claim is visible to everyone while the job runs.
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            UPDATE jobs SET status='running', claimed_by=%s, claimed_at=now(),
+                            progress=0
+            WHERE id = (SELECT id FROM jobs
+                        WHERE status='queued' AND kind = ANY(%s)
+                        ORDER BY priority, id
+                        FOR UPDATE SKIP LOCKED LIMIT 1)
+            RETURNING id, user_id::text AS user_id, kind, payload
+            """, (worker, kinds))
+        row = cur.fetchone()
+    conn.commit()
+    return row
+
+
+def has_queued_job(conn, kinds: list[str]) -> bool:
+    """One index probe (jobs_queue is partial on status='queued')."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT EXISTS (SELECT 1 FROM jobs WHERE status='queued' AND kind = ANY(%s))",
+                    (kinds,))
+        (v,) = cur.fetchone()
+    conn.commit()
+    return bool(v)
+
+
+def job_progress(conn, job_id: int, progress: float) -> None:
+    with conn.cursor() as cur:
+        cur.execute("UPDATE jobs SET progress=%s WHERE id=%s", (float(progress), job_id))
+    conn.commit()
+
+
+def finish_job(conn, job_id: int, *, result: dict | None = None,
+               error: str | None = None) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE jobs SET status=%s, finished_at=now(), result=%s, error=%s, "
+            "progress = CASE WHEN %s THEN 1 ELSE progress END WHERE id=%s",
+            ("failed" if error else "done",
+             json.dumps(result) if result is not None else None,
+             error, error is None, job_id))
+    conn.commit()
+
+
+def requeue_stale_jobs(conn, older_than_s: int = 1800) -> int:
+    """Jobs left 'running' by a worker that died go back in the queue.
+
+    Safe because runs are deduplicated: a half-finished sweep that restarts
+    skips everything it already recorded.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL "
+            "WHERE status='running' AND claimed_at < now() - make_interval(secs => %s)",
+            (older_than_s,))
+        n = cur.rowcount
+    conn.commit()
+    return n
+
+
+# -- refresher ---------------------------------------------------------------------
+
+def refresh_candidates(conn) -> list[dict]:
+    """Every stored series, with how stale it is and when it was last asked for."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT source, symbol, timeframe, asset_class, last_ts,
+                   EXTRACT(EPOCH FROM now())::bigint - last_ts AS age,
+                   EXTRACT(EPOCH FROM now() - checked_at)::bigint AS since_check
+            FROM series
+            """)
+        return cur.fetchall()

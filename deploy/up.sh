@@ -52,3 +52,12 @@ fi
 
 docker run --rm --network "$NET" -e BTB_DB_PASSWORD="$BTB_DB_PASSWORD" \
   btb-backend btb.data init
+
+# The worker: jobs, plus the data refresher when idle. Recreated on every run so
+# it always runs the image just built. One core, deliberately -- see README.
+docker rm -f btb-worker >/dev/null 2>&1 || true
+docker run -d --name btb-worker --network "$NET" --restart unless-stopped \
+  --cpus=1 --memory=2g \
+  -e BTB_DB_PASSWORD="$BTB_DB_PASSWORD" -e TZ=UTC \
+  btb-backend btb.engine worker >/dev/null
+echo "worker started (docker logs -f btb-worker)"

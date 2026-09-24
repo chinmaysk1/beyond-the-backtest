@@ -1,0 +1,2 @@
+# Shell scripts run on the Linux server; CRLF breaks them (`set -o pipefail`).
+*.sh text eol=lf
