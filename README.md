@@ -215,8 +215,59 @@ the test-window return, the equity curve, the best settings with their train
 rank, and a scatter of every combination's train rank against its test rank.
 Running a backtest always runs its sweep too. Details in `web/PLAN.md`.
 
+## Status — Week 4, the verdict engine
+
+`backend/btb/verdict/`. Every sweep now ends in one word -- ROBUST, WEAK or
+OVERFIT -- and one sentence saying why, from three independent checks over one
+matrix of daily returns (every grid combination, run once over train + test):
+
+| Check | Asks | Source |
+|---|---|---|
+| Walk-forward (`walkforward.py`) | Would picking settings this way have worked in real time? 5 anchored folds, each trading the settings that were best on everything before it. | Pardo (2008) |
+| PBO by CSCV (`cscv.py`) | How often does the in-sample winner land in the bottom half out of sample? 16 blocks, all 12,870 half/half splits. | Bailey, Borwein, López de Prado & Zhu (2016) |
+| Deflated Sharpe (`dsr.py`) | Is this Sharpe better than the best of N skill-less tries? N is the grid's exact size. | Bailey & López de Prado (2014) |
+
+`rules.py` turns them into the label: any failing check is OVERFIT; any warning,
+or too little data to run a check, is WEAK; ROBUST needs all of them. Walk-forward
+and PBO judge the grid, the deflated Sharpe each row, so no single setting can be
+ROBUST when picking from its grid is overfit. The verdict is always scored on the
+default windows -- a user can drag train and test to explore, but not until the
+label changes -- and never reads the holdout.
+
+```bash
+python -m btb.engine verdict   --strategy ema_cross_adx --symbol BTC/USD --timeframe 4h
+python -m btb.engine calibrate --symbol SPY --timeframe 1d --walks 50
+```
+
+**Checked against known answers.** The deflated Sharpe reproduces the paper's
+worked example (0.9004). PBO is ~0.5 on pure noise and ~0 with a planted edge.
+Walk-forward never reads a day after its fold. Rewriting the holdout changes
+nothing.
+
+**False positives: 0 of 600.** On random walks with the real series' timestamps
+and volatility -- where no strategy has an edge -- every library strategy was
+scored 50 times on BTC 4h and 50 times on SPY 1d. None came out ROBUST (target:
+at most 5%).
+
+**On real data, almost everything is overfit.** On BTC/USD 1d and SPY 1d, 11 of
+the 12 library strategy/market pairs come out OVERFIT and one (Bollinger + RSI on
+SPY) WEAK. The live EMA-cross + ADX strategy is OVERFIT on BTC 1d (PBO 0.53,
+deflated Sharpe 0.20) and WEAK on BTC 4h (PBO 0.21). Walk-forward returns that
+look large still trail buy-and-hold over the same periods: +938% against
++17,083% for EMA-cross + ADX on BTC 1d, +90% against +473% for EMA cross on SPY. This is the result the project exists to surface, not a
+calibration failure: the random walks show the engine is not simply harsh.
+
+**Results is where every test lives.** The Sweeps tab is gone. A run from
+Strategies lands on its page in Results: the headline return and the verdict,
+the equity curve with draggable train/test windows, every setting the sweep
+tried with its own verdict, and how the verdict was reached (the walk-forward
+periods and the overfitting test's distribution). The Results list shows every
+test with its verdict, filterable.
+
+The cost: a sweep takes roughly twice as long, because every combination is run
+once more over the whole span. On one core that is still seconds.
+
 ## Next
 
-Week 4: the verdict engine. Probability of backtest overfitting, a deflated
-statistic using the sweep's recorded N, regime segmentation, and the
-ROBUST / WEAK / OVERFIT label that replaces "unverified" on the leaderboard.
+Weeks 5–8: the guided flow end to end -- the plain-English questions that pick
+a market and strategy, on top of the Strategies and Results tabs that exist.

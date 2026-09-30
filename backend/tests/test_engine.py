@@ -13,6 +13,7 @@ made, or a bug that actually occurred while building this:
     test_out_key_is_not_a_reference       bbands out:"upper" read as a cycle
     test_partial_bar_is_never_read        the forming bar stays out of research
     test_sweep_resumes_without_rerunning  recorded work is recognised
+    test_moved_windows_never_reach_*      the holdout survives user-chosen windows
 """
 from __future__ import annotations
 
@@ -281,6 +282,80 @@ def test_short_series_is_thin_and_keeps_a_train_window():
     assert sp.holdout.end - sp.holdout.start <= 0.26 * (df["ts"].iloc[-1] - df["ts"].iloc[0])
 
 
+def _moved(sp, ts, *, start=200, boundary=1500, end=None):
+    """Windows as the UI sends them: train ends a second before the boundary."""
+    b = int(ts[boundary])
+    return {"train": [int(ts[start]), b - 1], "test": [b, int(end if end is not None else sp.test.end)]}
+
+
+def test_moved_windows_snap_to_bars_and_stay_contiguous(btc):
+    ts = btc["ts"].to_numpy()
+    sp = W.split(ts)
+    # Off-bar timestamps: starts snap forward, ends back.
+    mv = W.custom(ts, {"train": [int(ts[200]) + 5, int(ts[1500]) - 7],
+                       "test": [int(ts[1500]) - 6, int(ts[3000]) + 9]})
+    assert (mv.train.start, mv.train.end) == (ts[201], ts[1499])
+    assert (mv.test.start, mv.test.end) == (ts[1500], ts[3000])
+    assert mv.holdout == sp.holdout
+    assert mv.full().start == mv.train.start and mv.full().end == mv.test.end
+
+
+def test_default_windows_come_back_as_the_default_split(btc):
+    ts = btc["ts"].to_numpy()
+    sp = W.split(ts)
+    assert W.custom(ts, None) == sp and W.custom(ts, {}) == sp
+    b = sp.test.start
+    same = {"train": [sp.train.start, b - 1], "test": [b, sp.test.end]}
+    assert W.custom(ts, same) == sp                  # a reset dedupes with the default run
+
+
+def test_moved_windows_never_reach_the_holdout(btc):
+    ts = btc["ts"].to_numpy()
+    sp = W.split(ts)
+    for end in (sp.holdout.start, sp.holdout.start + 1, sp.holdout.end, int(ts[-1]) + 10**6):
+        with pytest.raises(W.WindowError, match=r"^windows\.test\[1\]: reaches into the holdout"):
+            W.custom(ts, _moved(sp, ts, end=end))
+    # The last bar before the holdout is fine; the holdout is untouched either way.
+    assert W.custom(ts, _moved(sp, ts)).holdout == sp.holdout
+    # Between the last open bar and the holdout's first: snaps back, never forward.
+    gap = W.custom(ts, _moved(sp, ts, end=sp.holdout.start - 1))
+    assert gap.test.end == sp.test.end < sp.holdout.start
+    with pytest.raises(W.WindowError, match=r"^windows\.holdout: unknown window"):
+        W.custom(ts, {**_moved(sp, ts), "holdout": [0, 1]})
+
+
+@pytest.mark.parametrize("windows, path", [
+    ("nope", r"windows: must be an object"),
+    ({"train": [1, 2]}, r"windows\.test: must be \[start, end\]"),
+    ({"train": [1, 2, 3], "test": [4, 5]}, r"windows\.train: must be \[start, end\]"),
+    ({"train": ["a", 2], "test": [4, 5]}, r"windows\.train\[0\]: must be a whole number"),
+    ({"train": [1.5, 2], "test": [4, 5]}, r"windows\.train\[0\]: must be a whole number"),
+    ({"train": [True, 2], "test": [4, 5]}, r"windows\.train\[0\]: must be a whole number"),
+])
+def test_malformed_windows_name_the_field(btc, windows, path):
+    with pytest.raises(W.WindowError, match="^" + path):
+        W.custom(btc["ts"].to_numpy(), windows)
+
+
+def test_moved_windows_are_ordered_inside_and_big_enough(btc):
+    ts = btc["ts"].to_numpy()
+    sp = W.split(ts)
+    ok = _moved(sp, ts)
+    cases = [
+        ({**ok, "train": [int(ts[0]) - 1, ok["train"][1]]}, r"windows\.train\[0\]: before the first bar"),
+        ({**ok, "train": [ok["train"][1], ok["train"][0]]}, r"windows\.train: start is after end"),
+        ({**ok, "test": [ok["train"][1], ok["test"][1]]}, r"windows\.test\[0\]: test must start after train"),
+        ({**ok, "test": [int(ts[1600]), ok["test"][1]]}, r"windows\.test\[0\]: test must start on the bar after"),
+        (_moved(sp, ts, start=1450), r"windows\.train: 50 bars; a moved window needs at least 100"),
+        (_moved(sp, ts, end=int(ts[1520])), r"windows\.test: 21 bars"),
+        ({"train": [int(ts[5]) + 1, int(ts[6]) - 1], "test": [int(ts[6]), ok["test"][1]]},
+         r"windows\.train: contains no bars"),
+    ]
+    for windows, path in cases:
+        with pytest.raises(W.WindowError, match="^" + path):
+            W.custom(ts, windows)
+
+
 # -- data access -------------------------------------------------------------------------------
 
 def test_partial_bar_is_never_read(monkeypatch):
@@ -316,6 +391,83 @@ def test_sweep_resumes_without_rerunning(btc):
                          record=lambda *a: recorded.append(a))
     assert recorded == [] and again["reused"] == again["evaluated"]
     assert again["top"] == first["top"]
+
+
+def test_sweep_resumes_with_moved_windows(btc):
+    """Moved windows are part of the key: a restarted sweep over them resumes,
+    and none of the default windows' work is mistaken for theirs."""
+    from btb.engine.jobs import sweep_series
+    spec = L.get("ema_cross")
+    s = B.Series.from_frame(btc, "4h")
+    sp = W.split(s.ts)
+    mv = W.custom(s.ts, _moved(sp, s.ts))
+    stored = {}
+
+    def record(n, p, r):
+        stored[(n, r.window, json.dumps(p, sort_keys=True))] = r.metrics
+
+    def done_for(split):
+        wins = {"train": (split.train.start, split.train.end), "test": (split.test.start, split.test.end)}
+        return lambda n, p: stored.get((n, wins[n], json.dumps(p, sort_keys=True)))
+
+    sweep_series(spec, s, Costs(), split=sp, record=record)
+    first = sweep_series(spec, s, Costs(), split=mv, record=record, done=done_for(mv))
+    assert first["reused"] == 0                     # the default run's work is not reused
+    assert first["windows"]["test"] == mv.test.as_dict()
+    assert first["windows"]["holdout"] == sp.holdout.as_dict()
+
+    again = sweep_series(spec, s, Costs(), split=W.custom(s.ts, _moved(sp, s.ts)),
+                         record=lambda *a: pytest.fail("re-ran recorded work"), done=done_for(mv))
+    assert again["reused"] == again["evaluated"] and again["top"] == first["top"]
+
+
+def test_jobs_run_on_moved_windows_and_report_them(monkeypatch, btc):
+    """The payload's windows reach the runs, the resume lookup and the result;
+    bad ones are refused with the field's path before anything runs."""
+    from btb import db
+    from btb.engine import jobs
+    s = B.Series.from_frame(btc, "4h", symbol="BTC/USD", asset_class="crypto",
+                            as_of=int(btc["ts"].iloc[-1]))
+    sp = W.split(s.ts)
+    moved = _moved(sp, s.ts)
+    strat = {"id": "sid", "name": "ema_cross", "spec": L.get("ema_cross"), "spec_sha": "x"}
+    monkeypatch.setattr(jobs, "_strategy", lambda *a: strat)
+    monkeypatch.setattr(jobs, "load_series", lambda *a: s)
+    runs, asked = [], []
+    monkeypatch.setattr(db, "insert_run", lambda conn, **kw: (runs.append(kw), (len(runs), True))[1])
+    monkeypatch.setattr(db, "insert_runs", lambda conn, rows: runs.extend(rows))
+    monkeypatch.setattr(db, "runs_for_windows", lambda conn, **kw: (asked.append(kw["windows"]), {})[1])
+
+    class Conn:
+        def commit(self):
+            pass
+
+    out = jobs.backtest_job(Conn(), {"symbol": "BTC/USD", "timeframe": "4h", "windows": moved})
+    mv = W.custom(s.ts, moved)
+    assert out["windows"] == mv.as_dict() and out["default_windows"] == sp.as_dict()
+    assert out["movable"] == {"start": int(s.ts[0]), "end": sp.test.end,
+                              "bars": int(np.searchsorted(s.ts, sp.test.end, side="right")),
+                              "min_bars": W.MIN_WINDOW_BARS}
+    got = {r["split"]: (r["window_start"], r["window_end"]) for r in runs}
+    assert got == {"train": (mv.train.start, mv.train.end), "test": (mv.test.start, mv.test.end),
+                   "full": (mv.train.start, mv.test.end)}
+    assert all(r["window_end"] < sp.holdout.start for r in runs)
+
+    runs.clear()
+    out = jobs.sweep_job(Conn(), {"symbol": "BTC/USD", "timeframe": "4h", "windows": moved})
+    # The moved windows' runs, then the default ones: the verdict is always
+    # scored on the default windows, whatever was dragged.
+    moved_w = {"train": (mv.train.start, mv.train.end), "test": (mv.test.start, mv.test.end)}
+    default_w = {"train": (sp.train.start, sp.train.end), "test": (sp.test.start, sp.test.end)}
+    assert asked == [moved_w, default_w]
+    assert {(r["window_start"], r["window_end"]) for r in runs} ==         set(moved_w.values()) | set(default_w.values())
+    assert out["windows"]["test"] == mv.test.as_dict()
+    assert out["verdict"]["windows"] == sp.as_dict()
+
+    bad = {**moved, "test": [moved["test"][0], sp.holdout.end]}
+    for job in (jobs.backtest_job, jobs.sweep_job):
+        with pytest.raises(jobs.JobError, match=r"^windows\.test\[1\]: reaches into the holdout"):
+            job(Conn(), {"symbol": "BTC/USD", "timeframe": "4h", "windows": bad})
 
 
 def test_sweep_ranks_on_test_not_train(btc):

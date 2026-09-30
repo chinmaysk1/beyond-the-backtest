@@ -5,12 +5,15 @@
     schema | catalog              the spec's JSON Schema / function catalog (what an AI is shown)
     run    --strategy S --symbol X --timeframe T [--param k=v ...] [--csv FILE]
     sweep  --strategy S --symbol X --timeframe T [--csv FILE] [--save]
+    verdict --strategy S --symbol X --timeframe T [--csv FILE]
+    calibrate --timeframe T [--csv FILE | --symbol X] [--walks N] [--strategy S ...]
     enqueue backtest|sweep --strategy S --symbol X --timeframe T [--param k=v ...]
     worker [--no-refresh] [--once]
     refresh                       fetch newly closed bars for every due series, once
 
-`run` and `sweep` read from the database unless given --csv, which runs fully
-offline on a file with columns time|ts, open, high, low, close, volume.
+`run`, `sweep`, `verdict` and `calibrate` read from the database unless given
+--csv, which runs fully offline on a file with columns time|ts, open, high, low,
+close, volume.
 """
 from __future__ import annotations
 
@@ -145,6 +148,63 @@ def cmd_sweep(args) -> int:
     return 0
 
 
+def cmd_verdict(args) -> int:
+    from .. import verdict as V
+    from .jobs import sweep_series
+    spec = L.get(args.strategy)
+    series = _series(args)
+    costs = _costs(args, series.asset_class)
+    v = V.evaluate(spec, series, costs, sweep_series(spec, series, costs, fill=args.fill),
+                   fill=args.fill)
+    _print_verdict(args.strategy, v)
+    for rank, r in v["rows"].items():
+        print(f"  #{rank:<3} {r['label']:<8} dsr {r['dsr']}  {json.dumps(r['params'])}")
+    return 0
+
+
+def _print_verdict(name: str, v: dict) -> None:
+    c = v["checks"]
+    wf, pb = c["walk_forward"], c["pbo"]
+    print(f"{name:<20} {v['label']:<8} {v['combos']:>3} settings  "
+          f"pbo {pb.get('value', '-')}  "
+          f"walk-forward {wf.get('oos_pct', '-')}% ({wf.get('folds_positive', '-')}/5 up, "
+          f"hold {wf.get('bh_pct', '-')}%)  dsr {c['dsr']['value']}  [{v['seconds']}s]")
+    print(f"{'':<20} {v['reason']}")
+
+
+def cmd_calibrate(args) -> int:
+    """Run the verdict on random walks, where no strategy has an edge, with the
+    real series' timestamps and volatility. ROBUST here is a false positive;
+    the target is at most 5% of runs."""
+    import numpy as np
+    from .. import verdict as V
+    from .jobs import sweep_series
+    real = _series(args)
+    close = real.frame.close
+    vol = float(np.std(np.diff(np.log(close))))
+    names = args.strategy or sorted(L.load_all())
+    rng = np.random.default_rng(args.seed)
+    counts = {n: {"ROBUST": 0, "WEAK": 0, "OVERFIT": 0} for n in names}
+    for i in range(args.walks):
+        c = close[0] * np.exp(np.cumsum(rng.normal(0, vol, len(close))))
+        df = pd.DataFrame({"ts": real.ts, "open": c, "high": c * (1 + vol), "low": c * (1 - vol),
+                           "close": c, "volume": 1.0})
+        walk = B.Series.from_frame(df, real.timeframe, asset_class=real.asset_class)
+        costs = _costs(args, walk.asset_class)
+        for n in names:
+            spec = L.get(n)
+            v = V.evaluate(spec, walk, costs, sweep_series(spec, walk, costs), fill=args.fill)
+            counts[n][v["label"]] += 1
+        print(f"walk {i + 1}/{args.walks}", file=sys.stderr)
+    total = sum(c["ROBUST"] for c in counts.values())
+    runs = args.walks * len(names)
+    print(f"{'strategy':<20} robust  weak  overfit   ({args.walks} random walks, vol {vol:.4f}/bar)")
+    for n, c in counts.items():
+        print(f"{n:<20} {c['ROBUST']:>6} {c['WEAK']:>5} {c['OVERFIT']:>8}")
+    print(f"false-positive rate: {total}/{runs} = {total / runs:.1%} (target <= 5%)")
+    return 0 if total / runs <= 0.05 else 1
+
+
 def cmd_enqueue(args) -> int:
     from .. import db
     payload = {"strategy": args.strategy, "symbol": args.symbol, "timeframe": args.timeframe}
@@ -211,6 +271,23 @@ def main(argv=None) -> int:
     market(s)
     s.add_argument("--save", action="store_true", help="record runs in the database")
     s.set_defaults(fn=cmd_sweep)
+
+    vd = sub.add_parser("verdict", help="sweep, then ROBUST / WEAK / OVERFIT and why")
+    market(vd)
+    vd.set_defaults(fn=cmd_verdict)
+
+    cb = sub.add_parser("calibrate", help="false-positive rate of the verdict on random walks")
+    cb.add_argument("--strategy", action="append", help="repeatable; default every library strategy")
+    cb.add_argument("--symbol")
+    cb.add_argument("--timeframe", required=True)
+    cb.add_argument("--commission", type=float, help="% per leg")
+    cb.add_argument("--slippage", type=float, help="bps per fill")
+    cb.add_argument("--fill", choices=["close", "open"], default="close")
+    cb.add_argument("--csv", help="take timestamps and volatility from this file")
+    cb.add_argument("--asset-class", default="crypto", choices=["crypto", "equity"])
+    cb.add_argument("--walks", type=int, default=50)
+    cb.add_argument("--seed", type=int, default=0)
+    cb.set_defaults(fn=cmd_calibrate)
 
     e = sub.add_parser("enqueue", help="queue a job for the worker")
     e.add_argument("kind", choices=["backtest", "sweep"])

@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 
 import type { Curve } from '../lib/types';
+import { moveHandle, type Handles, type Movable } from '../lib/windows';
 
 /* Strategy equity against buy-and-hold, with the training window shaded.
  *
@@ -13,19 +14,46 @@ import type { Curve } from '../lib/types';
  * Log scale whenever the curve spans more than 10x. BTC buy-and-hold from
  * 2011 is a 100,000x line; on a linear axis every strategy worth comparing to
  * it is a flat line along the bottom.
+ *
+ * With `windows`, the axis spans the whole series instead of the curve, and
+ * three handles move train start, the train/test boundary and test end. The
+ * holdout is drawn, locked, past the last one. The chart only reports moves:
+ * `onChange` on every step for instant feedback, `onCommit` on release or key,
+ * which is when the caller asks the engine for real numbers. Handles are DOM
+ * sliders over the canvas, so pointer, touch and keyboard all work.
  */
 
-type Props = { curve: Curve; trainEnd: number | null; capital?: number; animateKey?: string };
+export type WindowHandles = {
+  value: Handles;                        // train start, test start, test end
+  movable: Movable;
+  holdout: [number, number];
+  step: number;                          // one bar, in seconds
+  onChange: (h: Handles) => void;
+  onCommit: (h: Handles) => void;
+  settled: boolean;                      // the numbers on screen are for `value`
+};
+
+type Props = { curve: Curve; trainEnd: number | null; capital?: number; animateKey?: string; windows?: WindowHandles };
 
 const PAD = { r: 66, t: 8, b: 24 };
 const DRAW_MS = 1400;
+const HANDLES = [
+  { label: 'Train start', cls: 'start' },
+  { label: 'Train / test boundary', cls: 'mid' },
+  { label: 'Test end', cls: 'end' },
+] as const;
 
-export default function EquityChart({ curve, trainEnd, capital = 10_000, animateKey }: Props) {
+export default function EquityChart({ curve, trainEnd, capital = 10_000, animateKey, windows }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
   const [hover, setHover] = useState<number | null>(null);
   const [k, setK] = useState(1);
+  const [drag, setDrag] = useState<0 | 1 | 2 | null>(null);
+  // The newest value, for the release handler: a pointerup can arrive before
+  // the render that carries the last move.
+  const latest = useRef<Handles | null>(null);
+  latest.current = windows?.value ?? null;
 
   useEffect(() => {
     const el = wrapRef.current;
@@ -55,6 +83,12 @@ export default function EquityChart({ curve, trainEnd, capital = 10_000, animate
   const lo = vals.length ? Math.min(...vals) : 1;
   const hi = vals.length ? Math.max(...vals) : 1;
   const log = hi / Math.max(lo, 1e-9) > 10;
+  // The time axis: the whole series when windows can move, else the curve.
+  const d0 = windows ? windows.movable.start : curve.ts[0];
+  const d1 = windows ? windows.holdout[1] : curve.ts[n - 1];
+  const plotW = size.w - PAD.r;
+  const xt = (t: number) => ((t - d0) / Math.max(d1 - d0, 1)) * plotW;
+  const wv = windows?.value;
 
   useEffect(() => {
     const cv = canvasRef.current;
@@ -67,7 +101,7 @@ export default function EquityChart({ curve, trainEnd, capital = 10_000, animate
     g.clearRect(0, 0, size.w, size.h);
 
     const W = size.w - PAD.r, H = size.h - PAD.t - PAD.b;
-    const t0 = curve.ts[0], t1 = curve.ts[n - 1];
+    const t0 = d0, t1 = d1;
     const xt = (t: number) => ((t - t0) / Math.max(t1 - t0, 1)) * W;
     const x = (i: number) => xt(curve.ts[i]);
     const f = (v: number) => (log ? Math.log(Math.max(v, lo)) : v);
@@ -75,7 +109,26 @@ export default function EquityChart({ curve, trainEnd, capital = 10_000, animate
     const ylo = f(lo) - span * 0.03, yhi = f(hi) + span * 0.03;
     const y = (v: number) => PAD.t + (1 - (f(v) - ylo) / (yhi - ylo)) * H;
 
-    if (trainEnd && trainEnd > t0) {
+    if (windows && wv) {
+      // Train shaded as before; the holdout hatched and labelled locked.
+      const [a, b] = [xt(wv[0]), xt(wv[1])];
+      g.fillStyle = 'rgba(255,255,255,0.022)';
+      g.fillRect(a, PAD.t, b - a, H);
+      const hx = xt(windows.holdout[0]);
+      g.save();
+      g.beginPath(); g.rect(hx, PAD.t, W - hx, H); g.clip();
+      g.strokeStyle = '#1b1f24';
+      for (let i = hx - H; i < W; i += 7) { g.beginPath(); g.moveTo(i, PAD.t + H); g.lineTo(i + H, PAD.t); g.stroke(); }
+      g.restore();
+      g.strokeStyle = '#2a2f36';
+      g.beginPath(); g.moveTo(Math.round(hx) + 0.5, PAD.t); g.lineTo(Math.round(hx) + 0.5, PAD.t + H); g.stroke();
+      g.fillStyle = '#656c74';
+      g.font = '10.5px system-ui, sans-serif';
+      g.fillText('TRAIN', a + 12, PAD.t + 16);
+      g.fillText('TEST', b + 12, PAD.t + 16);
+      const tag = W - hx > g.measureText('HOLDOUT · LOCKED').width + 16 ? 'HOLDOUT · LOCKED' : 'HOLDOUT';
+      if (W - hx > g.measureText(tag).width + 16) g.fillText(tag, hx + 10, PAD.t + 16);
+    } else if (trainEnd && trainEnd > t0) {
       const tx = Math.min(xt(trainEnd), W);
       g.fillStyle = 'rgba(255,255,255,0.022)';
       g.fillRect(0, PAD.t, tx, H);
@@ -128,6 +181,14 @@ export default function EquityChart({ curve, trainEnd, capital = 10_000, animate
     g.strokeStyle = '#e7e9ec'; g.lineWidth = 1.7; g.stroke();
     g.lineWidth = 1;
 
+    if (windows && wv) {
+      // Outside train and test: drawn over, so a curve from wider windows
+      // visibly stops counting where the handles now are.
+      g.fillStyle = 'rgba(15,17,20,0.72)';
+      g.fillRect(0, PAD.t - 2, xt(wv[0]), H + 4);
+      g.fillRect(xt(wv[2]), PAD.t - 2, xt(windows.holdout[0]) - xt(wv[2]), H + 4);
+    }
+
     if (k < 1) {
       const hx = x(m - 1), hy = y(Math.max(curve.equity[m - 1], lo));
       g.fillStyle = 'rgba(255,255,255,.14)'; g.beginPath(); g.arc(hx, hy, 9, 0, 7); g.fill();
@@ -141,25 +202,75 @@ export default function EquityChart({ curve, trainEnd, capital = 10_000, animate
         g.fillStyle = c; g.beginPath(); g.arc(hx, y(Math.max(arr[hover], lo)), 3, 0, 7); g.fill();
       }
     }
-  }, [curve, size, hover, k, trainEnd, lo, hi, log, capital, n]);
+  }, [curve, size, hover, k, trainEnd, lo, hi, log, capital, n, d0, d1, windows, wv]);
+
+  const timeAt = (clientX: number) => {
+    const rect = wrapRef.current!.getBoundingClientRect();
+    return d0 + ((clientX - rect.left) / Math.max(plotW, 1)) * (d1 - d0);
+  };
 
   function onMove(e: React.MouseEvent) {
-    if (n < 2 || !size.w) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const t = curve.ts[0] + ((e.clientX - rect.left) / (size.w - PAD.r)) * (curve.ts[n - 1] - curve.ts[0]);
+    if (n < 2 || !size.w || drag !== null) return;
+    const t = timeAt(e.clientX);
+    if (t < curve.ts[0] || t > curve.ts[n - 1]) { setHover(null); return; }
     let best = 0;
     for (let i = 1; i < n; i++) if (Math.abs(curve.ts[i] - t) < Math.abs(curve.ts[best] - t)) best = i;
     setHover(best);
   }
+
+  /* -- handles ---------------------------------------------------------------- */
+
+  function move(which: 0 | 1 | 2, t: number) {
+    if (!windows || !latest.current) return null;
+    const next = moveHandle(latest.current, which, t, windows.movable, windows.step);
+    latest.current = next;
+    windows.onChange(next);
+    return next;
+  }
+
+  function onKey(which: 0 | 1 | 2, e: React.KeyboardEvent) {
+    if (!windows || !wv) return;
+    // Arrows move a hundredth of the series, snapped; shift moves one bar.
+    const { movable: m, step } = windows;
+    const big = Math.max(step, Math.round((m.end - m.start) / 100 / step) * step);
+    const by = e.shiftKey ? step : big;
+    const t = e.key === 'ArrowLeft' || e.key === 'ArrowDown' ? wv[which] - by
+      : e.key === 'ArrowRight' || e.key === 'ArrowUp' ? wv[which] + by
+        : e.key === 'Home' ? -Infinity : e.key === 'End' ? Infinity : null;
+    if (t === null) return;
+    e.preventDefault();
+    const next = move(which, Number.isFinite(t) ? t : t < 0 ? m.start - 1e12 : m.end + 1e12);
+    if (next) windows.onCommit(next);
+  }
+
+  // A preview from the drawn curve while a handle moves: equity at one
+  // boundary over equity at the other. Not the engine's number -- positions
+  // carried across a boundary, costs already paid -- so it is labelled as an
+  // estimate and gone once the real run lands.
+  const eqAt = (t: number) => {
+    if (n < 2 || t < curve.ts[0] || t > curve.ts[n - 1]) return null;
+    let i = 0;
+    while (i + 1 < n && curve.ts[i + 1] <= t) i++;
+    return curve.equity[i] > 0 ? curve.equity[i] : null;
+  };
+  const ret = (a: number, b: number) => {
+    const x = eqAt(a), y = eqAt(b);
+    return x && y ? pctOf(y / x - 1) : 'n/a';
+  };
+  const previewing = windows && wv && (drag !== null || !windows.settled);
 
   return (
     <div className="eq">
       <div className="eq-legend">
         <span><i style={{ background: '#e7e9ec' }} />Strategy</span>
         <span><i style={{ background: '#4b535c' }} />Buy &amp; hold</span>
-        <span className="eq-dim">{log ? 'log scale · ' : ''}shaded = training window</span>
+        <span className="eq-dim">{log ? 'log scale · ' : ''}{windows ? 'drag the lines to move train and test' : 'shaded = training window'}</span>
         <span className="eq-read mono">
-          {hover !== null && (
+          {previewing ? (
+            <span className="eq-est" title="Read off the curve on screen. Release to have the engine re-run both windows.">
+              estimate from this curve{'   '}train <b>{ret(wv[0], wv[1])}</b>{'   '}test <b>{ret(wv[1], wv[2])}</b>
+            </span>
+          ) : hover !== null && (
             <>{new Date(curve.ts[hover] * 1000).toISOString().slice(0, 10)}{'   '}
               <b>{money(curve.equity[hover])}</b>{'  strategy   '}{money(curve.bh[hover])}{'  hold'}</>
           )}
@@ -167,9 +278,46 @@ export default function EquityChart({ curve, trainEnd, capital = 10_000, animate
       </div>
       <div ref={wrapRef} className="eq-canvas" onMouseMove={onMove} onMouseLeave={() => setHover(null)}>
         <canvas ref={canvasRef} style={{ width: size.w, height: size.h }} />
+        {windows && wv && size.w > 0 && HANDLES.map((h, i) => {
+          const which = i as 0 | 1 | 2;
+          const release = () => {
+            if (drag !== which) return;
+            setDrag(null);
+            if (latest.current) windows.onCommit(latest.current);
+          };
+          return (
+            <div key={h.cls} className={`eq-h ${h.cls} ${drag === which ? 'on' : ''}`} style={{ left: xt(wv[which]) }}
+                 role="slider" tabIndex={0} aria-label={h.label}
+                 aria-valuemin={windows.movable.start} aria-valuemax={windows.movable.end} aria-valuenow={wv[which]}
+                 aria-valuetext={isoDay(wv[which])}
+                 onPointerDown={(e) => {
+                   if (e.button !== 0) return;
+                   e.preventDefault();
+                   e.currentTarget.setPointerCapture(e.pointerId);
+                   e.currentTarget.focus();
+                   setDrag(which);
+                   setHover(null);
+                 }}
+                 onPointerMove={(e) => { if (drag === which) move(which, timeAt(e.clientX)); }}
+                 onPointerUp={release} onPointerCancel={release}
+                 onKeyDown={(e) => onKey(which, e)}>
+              <i />
+              <small className="mono">{isoDay(wv[which])}</small>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
+}
+
+function isoDay(t: number): string {
+  return new Date(t * 1000).toISOString().slice(0, 10);
+}
+
+function pctOf(v: number): string {
+  const p = v * 100;
+  return `${p >= 0 ? '+' : '−'}${Math.abs(p).toLocaleString('en-US', { maximumFractionDigits: Math.abs(p) >= 100 ? 0 : 1 })}%`;
 }
 
 function ticks(lo: number, hi: number, log: boolean): number[] {

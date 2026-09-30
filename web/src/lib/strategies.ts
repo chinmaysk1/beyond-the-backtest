@@ -2,6 +2,8 @@
  * to the engine. The engine remains the authority -- it re-validates every
  * job -- so these only have to agree with it, not replace it. */
 
+import type { StrategyInfo } from './types';
+
 const CONSTRAINT = /^\s*([A-Za-z_]\w*|-?\d+(?:\.\d+)?)\s*(<=|>=|==|!=|<|>)\s*([A-Za-z_]\w*|-?\d+(?:\.\d+)?)\s*$/;
 
 function holds(constraints: string[], p: Record<string, number>): boolean {
@@ -31,4 +33,18 @@ export function comboCount(
   };
   walk(0, { ...defaults });
   return n;
+}
+
+/** What the picker shows for a spec, library or custom alike. */
+export function strategyInfo(name: string, s: Record<string, any>): StrategyInfo {
+  return {
+    name,
+    title: s.title ?? name,
+    description: s.description ?? '',
+    style: s.style ?? 'other',
+    timeframes: s.timeframes ?? [],
+    defaults: s.defaults ?? {},
+    labels: s.labels ?? {},
+    combos: comboCount(s.grid ?? {}, s.defaults ?? {}, s.constraints ?? []),
+  };
 }

@@ -13,7 +13,8 @@ import CandleChart from './CandleChart';
 import Landing, { type Stage } from './Landing';
 import MarketList from './MarketList';
 import SoonView from './SoonView';
-import StrategiesView, { loadLibrary } from './StrategiesView';
+import ResultsView from './ResultsView';
+import StrategiesView, { loadLibrary, type Opened } from './StrategiesView';
 
 /* Bars per request. Large enough that the first screen is never short, small
  * enough that switching symbols is instant on a 315,000-bar series. */
@@ -39,10 +40,12 @@ export default function Dashboard({ username }: { username: string }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<RoomId>('data');
+  // The test open in Results, if any: where a run from Strategies lands.
+  const [opened, setOpened] = useState<Opened | null>(null);
 
   /* -- landing <-> app ------------------------------------------------------
    *
-   * Every visit opens on the landing. Choosing a room flies the five cards
+   * Every visit opens on the landing. Choosing a room flies the four cards
    * into the nav tabs and the wordmark into the brand, while the room rises
    * from below; the brand (or Esc) plays it backwards. See lib/flight.ts. */
   const [stage, setStage] = useState<Stage>('landing');
@@ -231,7 +234,8 @@ export default function Dashboard({ username }: { username: string }) {
               ref={(el) => { if (el) tabsRef.current[i] = el; }}
               className={tab === r.id ? 'on' : ''}
               type="button"
-              onClick={() => setTab(r.id)}
+              // Results again, from inside a test, goes back to the list.
+              onClick={() => { if (r.id === 'results' && tab === 'results') setOpened(null); setTab(r.id); }}
             >
               {r.title}{!r.live && <span className="soon-dot" />}
             </button>
@@ -256,7 +260,8 @@ export default function Dashboard({ username }: { username: string }) {
       </nav>
 
       <div className="stage">
-      {tab === 'strategies' ? <StrategiesView markets={markets} />
+      {tab === 'strategies' ? <StrategiesView markets={markets} onDone={(t) => { setOpened(t); setTab('results'); }} />
+        : tab === 'results' ? <ResultsView open={opened} setOpen={setOpened} onNewTest={() => setTab('strategies')} />
         : tab !== 'data' ? <SoonView room={tab} /> : (<>
       <div className="head">
         <div className="title">

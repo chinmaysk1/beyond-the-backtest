@@ -3,14 +3,19 @@
 Two job kinds, both payloads validated here rather than trusted from the web
 app -- the app checks what it can, but this is the side that spends the CPU:
 
-    backtest  {"strategy", "symbol", "timeframe", "params"?, "costs"?, "fill"?}
+    backtest  {"strategy", "symbol", "timeframe", "params"?, "costs"?, "fill"?,
+               "windows"?}
               One parameter set, run on train, test and full (train+test).
               The full run keeps its trades and equity curve for the UI.
 
-    sweep     {"strategy", "symbol", "timeframe", "costs"?, "fill"?}
+    sweep     {"strategy", "symbol", "timeframe", "costs"?, "fill"?, "windows"?}
               Every grid combination on train and on test. Ranked on TEST.
+              Ends with the verdict (btb.verdict), always on the default windows.
 
-Neither touches the holdout.
+`windows` moves train and test: {"train": [start, end], "test": [start, end]}
+in unix seconds (see windows.custom). Omitted, the default split is used.
+
+Neither touches the holdout, and no `windows` can make them.
 """
 from __future__ import annotations
 
@@ -19,6 +24,7 @@ import time
 from typing import Callable
 
 from .. import db
+from .. import verdict as V
 from ..data import adjust as ADJ
 from . import backtest as B
 from . import spec as S
@@ -116,6 +122,21 @@ def _fill(payload: dict) -> str:
     return fill
 
 
+def _split(payload: dict, series: B.Series) -> W.Split:
+    try:
+        return W.custom(series.ts, payload.get("windows"))
+    except W.WindowError as e:
+        raise JobError(str(e)) from None
+
+
+def _windows_out(split: W.Split, series: B.Series) -> dict:
+    """The windows a job ran on, the defaults, and what may be moved: the UI
+    draws all three and resets to the second."""
+    base = W.split(series.ts)
+    return {"windows": split.as_dict(), "default_windows": base.as_dict(),
+            "movable": W.movable(series.ts, base)}
+
+
 def summary(m: dict) -> dict:
     return {k: m.get(k) for k in SUMMARY_KEYS}
 
@@ -137,7 +158,7 @@ def backtest_job(conn, payload: dict, *, job_id: int | None = None,
     costs = parse_costs(payload.get("costs"), series.asset_class)
     fill = _fill(payload)
     cfg = B.config(costs, fill=fill, adjust=series.adjust)
-    split = W.split(series.ts)
+    split = _split(payload, series)
 
     runs, metrics = {}, {}
     for w in (split.train, split.test, split.full()):
@@ -157,7 +178,7 @@ def backtest_job(conn, payload: dict, *, job_id: int | None = None,
         "strategy": strat["name"], "spec_sha": strat["spec_sha"],
         "symbol": series.symbol, "timeframe": series.timeframe,
         "as_of": series.as_of, "adjust": series.adjust,
-        "params": params, "config": cfg, "windows": split.as_dict(),
+        "params": params, "config": cfg, **_windows_out(split, series),
         "runs": runs, "metrics": metrics,
         "seconds": round(time.perf_counter() - t0, 2),
     }
@@ -216,6 +237,8 @@ def sweep_series(spec: dict, series: B.Series, costs: Costs, *, fill: str = "clo
         "combos": len(combos), "raw_grid": raw, "evaluated": total, "reused": reused,
         "ranked_on": "test", "windows": split.as_dict(),
         "top": ranked[:10],
+        # Every combination, test-ranked, for the test page's full table.
+        "rows": ranked,
         # [train_rank, test_rank] for every combination, for the rank scatter.
         "ranks": [[r["train_rank"], r["test_rank"]] for r in ranked],
         # Rank agreement across the whole grid. Near +1: settings that did well
@@ -236,17 +259,19 @@ def sweep_job(conn, payload: dict, *, job_id: int | None = None,
     costs = parse_costs(payload.get("costs"), series.asset_class)
     fill = _fill(payload)
     cfg = B.config(costs, fill=fill, adjust=series.adjust)
-    split = W.split(series.ts)
-    # split() snaps boundaries to real bars, so these are exactly the windows a
-    # run records -- which is what lets a restarted sweep recognise its work.
+    split = _split(payload, series)
     key = dict(strategy_id=strat["id"], symbol=series.symbol, timeframe=series.timeframe)
-    existing = db.runs_for_windows(conn, config=cfg, windows={
-        w.name: (w.start, w.end) for w in (split.train, split.test)}, **key)
     pending: list[dict] = []
     last = [time.perf_counter()]
 
-    def done(name, p):
-        return existing.get((name, json.dumps(p, sort_keys=True)))
+    def recorded(sp: W.Split):
+        # Boundaries are snapped to real bars, default or moved, so these are
+        # exactly the windows a run records -- which is what lets a restarted
+        # sweep recognise its work, and a sweep over the same moved windows
+        # reuse it.
+        existing = db.runs_for_windows(conn, config=cfg, windows={
+            w.name: (w.start, w.end) for w in (sp.train, sp.test)}, **key)
+        return lambda name, p: existing.get((name, json.dumps(p, sort_keys=True)))
 
     def record(name, p, r):
         pending.append(dict(job_id=job_id, params=r.params, window_start=r.window[0],
@@ -270,11 +295,21 @@ def sweep_job(conn, payload: dict, *, job_id: int | None = None,
             last[0] = now
 
     out = sweep_series(spec, series, costs, fill=fill, split=split, record=record,
-                       done=done, progress=progress)
+                       done=recorded(split), progress=progress)
     conn.commit()
+
+    # The verdict is always scored on the DEFAULT windows: one that moved with
+    # dragged windows could be dragged until it said ROBUST. Moved windows need
+    # the default ranking too; its runs are usually recorded already.
+    base = W.split(series.ts)
+    ranked = out if split == base else sweep_series(
+        spec, series, costs, fill=fill, split=base, record=record, done=recorded(base))
+    flush()
+    out["verdict"] = V.evaluate(spec, series, costs, ranked, fill=fill, split=base)
     out.update({"strategy": strat["name"], "spec_sha": strat["spec_sha"],
                 "symbol": series.symbol, "timeframe": series.timeframe,
                 "as_of": series.as_of, "adjust": series.adjust, "config": cfg,
+                **_windows_out(split, series),
                 "seconds": round(time.perf_counter() - t0, 2)})
     return out
 

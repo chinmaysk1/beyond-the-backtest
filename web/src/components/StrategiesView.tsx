@@ -4,18 +4,19 @@ import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 import { AI_PROMPT, EXAMPLE_SPEC, PROMPT_PLACEHOLDER, checkSpecText, type SpecCheck } from '../lib/specCheck';
-import type { Costs, Job, Market, Metrics, StrategyInfo, SweepRow, Trade } from '../lib/types';
+import { clamp, date } from '../lib/format';
+import { pollJob, submitJob } from '../lib/jobs';
+import type { Costs, CustomStrategyInfo, Job, Market, StrategyInfo } from '../lib/types';
 
-import EquityChart, { money } from './EquityChart';
-import RankScatter from './RankScatter';
-
-/* The Strategies tab, as one flow in three phases:
+/* The Strategies tab, as one flow in two phases:
  *
  *   compose   one question, centred: which market, which timeframe, which
  *             strategy (from the library, or your own JSON), at what cost
  *   running   the backtest and its sweep, live from the worker
- *   results   a page, not a grid of boxes: the return on data it never saw,
- *             the curve, the best settings and how much to trust them, trades
+ *
+ * Then the test opens in the Results tab (TestView), where every test lives:
+ * the return on data it never saw, the verdict, the curve, every setting the
+ * sweep tried and how much to trust the best one.
  *
  * "Run backtest" always queues the sweep too. Finding the best settings is not
  * a separate decision the user has to know to make -- and a best-settings list
@@ -23,8 +24,7 @@ import RankScatter from './RankScatter';
  * number this product exists to replace.
  */
 
-type Phase = 'compose' | 'running' | 'results';
-type Window = 'train' | 'test' | 'full';
+type Phase = 'compose' | 'running';
 
 const ALL_TF = ['5m', '15m', '30m', '1h', '4h', '1d'];
 // Mirrors btb/engine/fills.py DEFAULT_COSTS. The form starts here; the engine
@@ -33,26 +33,30 @@ const DEFAULT_COSTS: Record<string, Costs> = {
   crypto: { commission_pct: 0.1, slippage_bps: 5 },
   equity: { commission_pct: 0, slippage_bps: 2 },
 };
-const POLL_MS = 600;
 const MIN_RUN_MS = 2200;      // long enough to read what happened, never padded past that
 
-export default function StrategiesView({ markets }: { markets: Market[] }) {
+export type Opened = { id: number; sweepId: number | null };
+
+/* What was last composed, so coming back from a test's page to run another
+ * starts where the last one left off. Module state: it outlives the tab. */
+let last: { symbol: string | null; timeframe: string; source: 'lib' | 'json'; strategy: string;
+            jsonText: string; costs: Costs } | null = null;
+
+export default function StrategiesView({ markets, onDone }: { markets: Market[]; onDone: (t: Opened) => void }) {
   const router = useRouter();
   const [strategies, setStrategies] = useState<StrategyInfo[]>([]);
-  const [symbol, setSymbol] = useState<string | null>(null);
-  const [timeframe, setTimeframe] = useState('4h');
-  const [source, setSource] = useState<'lib' | 'json'>('lib');
-  const [strategy, setStrategy] = useState('ema_cross_adx');
-  const [jsonText, setJsonText] = useState('');
-  const [costs, setCosts] = useState<Costs>(DEFAULT_COSTS.crypto);
+  const [custom, setCustom] = useState<CustomStrategyInfo[]>([]);
+  const [symbol, setSymbol] = useState<string | null>(last?.symbol ?? null);
+  const [timeframe, setTimeframe] = useState(last?.timeframe ?? '4h');
+  const [source, setSource] = useState<'lib' | 'json'>(last?.source ?? 'lib');
+  const [strategy, setStrategy] = useState(last?.strategy ?? 'ema_cross_adx');
+  const [jsonText, setJsonText] = useState(last?.jsonText ?? '');
+  const [costs, setCosts] = useState<Costs>(last?.costs ?? DEFAULT_COSTS.crypto);
   const [costsOpen, setCostsOpen] = useState(false);
 
   const [phase, setPhase] = useState<Phase>('compose');
   const [bt, setBt] = useState<Job | null>(null);
   const [sw, setSw] = useState<Job | null>(null);
-  const [view, setView] = useState<Window>('test');
-  const [chosen, setChosen] = useState<number | null>(null);
-  const [rerunning, setRerunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Set on mount as well as cleared on unmount: React's development mode
   // mounts, unmounts and remounts every component once, and a flag that is only
@@ -62,6 +66,10 @@ export default function StrategiesView({ markets }: { markets: Market[] }) {
     alive.current = true;
     return () => { alive.current = false; };
   }, []);
+
+  useEffect(() => {
+    last = { symbol, timeframe, source, strategy, jsonText, costs };
+  }, [symbol, timeframe, source, strategy, jsonText, costs]);
 
   const market = useMemo(() => markets.find((m) => m.symbol === symbol) ?? null, [markets, symbol]);
   const spec = strategies.find((s) => s.name === strategy) ?? null;
@@ -78,7 +86,24 @@ export default function StrategiesView({ markets }: { markets: Market[] }) {
         if (e.message === 'signed out') router.replace('/login');
         else setError('Could not load the strategy library');
       });
+    refreshCustom();
   }, [router]);
+
+  // Past JSON strategies change whenever one runs, so unlike the library this
+  // is fetched fresh each time. Not having them is not worth an error.
+  function refreshCustom() {
+    fetch('/api/strategies/custom')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((out) => { if (out && alive.current) setCustom(out.strategies ?? []); })
+      .catch(() => {});
+  }
+
+  // A past spec goes back through the JSON box, so it is checked and run
+  // exactly as if it had just been pasted.
+  const pickCustom = useCallback((c: CustomStrategyInfo) => {
+    setJsonText(JSON.stringify(c.spec, null, 2));
+    setSource('json');
+  }, []);
 
   const pickMarket = useCallback((m: Market) => {
     setSymbol(m.symbol);
@@ -92,58 +117,31 @@ export default function StrategiesView({ markets }: { markets: Market[] }) {
     pickMarket(markets.find((m) => m.symbol === 'BTC/USD') ?? markets[0]);
   }, [markets, symbol, pickMarket]);
 
-  /* -- jobs ---------------------------------------------------------------- */
+  /* -- run ----------------------------------------------------------------- */
 
-  const poll = useCallback(async (id: number, onUpdate: (j: Job) => void): Promise<Job> => {
-    for (;;) {
-      if (!alive.current) throw new Error('gone');
-      try {
-        const res = await fetch(`/api/backtests/${id}`);
-        if (res.status === 401) { router.replace('/login'); throw new Error('signed out'); }
-        const job: Job = await res.json();
-        onUpdate(job);
-        if (job.status === 'done' || job.status === 'failed' || job.status === 'cancelled') return job;
-      } catch (e) {
-        if ((e as Error).message === 'signed out') throw e;
-      }
-      await new Promise((r) => setTimeout(r, POLL_MS));
-    }
-  }, [router]);
-
-  function body(extra: Record<string, unknown>) {
-    const b: Record<string, unknown> = { symbol, timeframe, costs, ...extra };
-    if (source === 'json' && check?.ok) b.spec = check.spec;
-    else b.strategy = strategy;
-    return b;
-  }
-
-  async function submit(b: Record<string, unknown>) {
-    const res = await fetch('/api/backtests', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b),
-    });
-    const out = await res.json();
-    if (!res.ok) throw new Error(out.error ?? 'Could not queue the job');
-    return out as { id: number; sweepId: number | null };
-  }
-
+  // Queue the backtest and its sweep, show them working, then hand the test
+  // to the Results tab -- its page is where every result lives.
   async function run() {
     if (!canRun) return;
     setError(null);
-    setChosen(null);
-    setView('test');
     setBt(null);
     setSw(null);
     const started = performance.now();
+    const body: Record<string, unknown> = { kind: 'backtest', withSweep: true, symbol, timeframe, costs };
+    if (source === 'json' && check?.ok) body.spec = check.spec;
+    else body.strategy = strategy;
     let ids;
     try {
-      ids = await submit(body({ kind: 'backtest', withSweep: true }));
+      ids = await submitJob(body);
     } catch (e) {
       setError((e as Error).message);
       return;
     }
     setPhase('running');
+    if (source === 'json') refreshCustom();
+    const live = () => alive.current;
     try {
-      const [b] = await Promise.all([poll(ids.id, setBt), ids.sweepId ? poll(ids.sweepId, setSw) : null]);
+      const [b] = await Promise.all([pollJob(ids.id, setBt, live), ids.sweepId ? pollJob(ids.sweepId, setSw, live) : null]);
       if (b.status !== 'done') {
         setError(b.error ?? 'The backtest failed');
         setPhase('compose');
@@ -151,35 +149,13 @@ export default function StrategiesView({ markets }: { markets: Market[] }) {
       }
       const wait = MIN_RUN_MS - (performance.now() - started);
       if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-      if (alive.current) setPhase('results');
-    } catch {
-      /* unmounted or signed out */
-    }
-  }
-
-  async function applyRow(row: SweepRow) {
-    if (rerunning) return;
-    if (chosen === row.test_rank) {         // clicking the chosen row goes back to defaults
-      setChosen(null);
-      return run();
-    }
-    setRerunning(true);
-    setChosen(row.test_rank);
-    try {
-      const { id } = await submit(body({ kind: 'backtest', params: row.params }));
-      const job = await poll(id, () => {});
-      if (job.status === 'done') setBt(job);
-      else setError(job.error ?? 'The re-run failed');
+      if (alive.current) onDone({ id: ids.id, sweepId: ids.sweepId });
     } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setRerunning(false);
+      if ((e as Error).message === 'signed out') router.replace('/login');
     }
   }
 
   /* -- render -------------------------------------------------------------- */
-
-  const title = source === 'json' && check?.ok ? (check.spec.title ?? check.spec.name) : spec?.title ?? '';
 
   return (
     <div className="sv">
@@ -189,6 +165,7 @@ export default function StrategiesView({ markets }: { markets: Market[] }) {
           timeframe={timeframe} setTimeframe={setTimeframe}
           source={source} setSource={setSource}
           strategies={strategies} strategy={strategy} setStrategy={setStrategy}
+          custom={custom} pickCustom={pickCustom}
           jsonText={jsonText} setJsonText={setJsonText} check={check}
           costs={costs} setCosts={setCosts} costsOpen={costsOpen} setCostsOpen={setCostsOpen}
           combos={combos} canRun={canRun} onRun={run} error={error}
@@ -198,17 +175,6 @@ export default function StrategiesView({ markets }: { markets: Market[] }) {
       <div className={`sv-phase ${phase === 'running' ? 'on' : ''}`}>
         {phase === 'running' && (
           <Running market={market} timeframe={timeframe} bt={bt} sw={sw} combos={combos} />
-        )}
-      </div>
-
-      <div className={`sv-phase ${phase === 'results' ? 'on' : ''}`}>
-        {phase === 'results' && bt?.result && (
-          <Results
-            title={title} bt={bt} sw={sw} view={view} setView={setView}
-            chosen={chosen} rerunning={rerunning} onUse={applyRow} error={error}
-            labels={source === 'json' && check?.ok ? check.spec.labels ?? {} : spec?.labels ?? {}}
-            onBack={() => { setPhase('compose'); setError(null); }}
-          />
         )}
       </div>
     </div>
@@ -236,6 +202,7 @@ type ComposeProps = {
   timeframe: string; setTimeframe: (t: string) => void;
   source: 'lib' | 'json'; setSource: (s: 'lib' | 'json') => void;
   strategies: StrategyInfo[]; strategy: string; setStrategy: (s: string) => void;
+  custom: CustomStrategyInfo[]; pickCustom: (c: CustomStrategyInfo) => void;
   jsonText: string; setJsonText: (s: string) => void; check: SpecCheck | null;
   costs: Costs; setCosts: (c: Costs) => void; costsOpen: boolean; setCostsOpen: (b: boolean) => void;
   combos: number; canRun: boolean; onRun: () => void; error: string | null;
@@ -282,7 +249,7 @@ function Compose(p: ComposeProps) {
               <Seg value={p.source} onChange={(v) => p.setSource(v as 'lib' | 'json')}
                    options={[{ id: 'lib', label: 'Library' }, { id: 'json', label: 'Custom JSON' }]} />
               {p.source === 'lib'
-                ? <Library strategies={p.strategies} value={p.strategy} onChange={p.setStrategy} />
+                ? <Library strategies={p.strategies} custom={p.custom} value={p.strategy} onChange={p.setStrategy} onCustom={p.pickCustom} />
                 : <CustomJson text={p.jsonText} setText={p.setJsonText} check={p.check} />}
             </div>
           </div>
@@ -394,11 +361,31 @@ function Seg({ value, options, onChange }: { value: string; options: SegOpt[]; o
   );
 }
 
-function Library({ strategies, value, onChange }: { strategies: StrategyInfo[]; value: string; onChange: (s: string) => void }) {
+type LibraryProps = {
+  strategies: StrategyInfo[]; custom: CustomStrategyInfo[];
+  value: string; onChange: (s: string) => void; onCustom: (c: CustomStrategyInfo) => void;
+};
+
+/* The library, then the user's own past JSON strategies under it. One search
+ * box filters both. Picking a past one opens it in Custom JSON to run again. */
+function Library({ strategies, custom, value, onChange, onCustom }: LibraryProps) {
+  const [q, setQ] = useState('');
   if (!strategies.length) return <div className="sv-note" style={{ marginTop: 12 }}>Loading the library…</div>;
+  const needle = q.trim().toLowerCase();
+  const match = (s: StrategyInfo) => `${s.name} ${s.title} ${s.description} ${s.style}`.toLowerCase().includes(needle);
+  const lib = strategies.filter(match);
+  const mine = custom.filter(match);
   return (
     <div className="sv-lib">
-      {strategies.map((s) => (
+      <input className="sv-lib-search" value={q} onChange={(e) => setQ(e.target.value)}
+             placeholder={`Search ${strategies.length + custom.length} strategies`}
+             onKeyDown={(e) => {
+               if (e.key === 'Enter') { if (lib[0]) onChange(lib[0].name); else if (mine[0]) onCustom(mine[0]); }
+               if (e.key === 'Escape') setQ('');
+             }} />
+      {!lib.length && !mine.length && <div className="sv-note">Nothing matches “{q.trim()}”.</div>}
+      {custom.length > 0 && lib.length > 0 && <h6>Library</h6>}
+      {lib.map((s) => (
         <button key={s.name} type="button" className={`sv-lib-row ${s.name === value ? 'on' : ''}`} onClick={() => onChange(s.name)}>
           <span className="sv-dot" />
           <span>
@@ -406,6 +393,17 @@ function Library({ strategies, value, onChange }: { strategies: StrategyInfo[]; 
             <span className="sv-desc"><span>{s.description}</span></span>
           </span>
           <span className="sv-meta"><span>{s.combos} settings</span>{s.style}</span>
+        </button>
+      ))}
+      {mine.length > 0 && <h6>Custom</h6>}
+      {mine.map((c) => (
+        <button key={c.id} type="button" className="sv-lib-row" title="Open in Custom JSON to run it again" onClick={() => onCustom(c)}>
+          <span className="sv-dot" />
+          <span>
+            <b>{c.title}</b>
+            {c.description && <span className="sv-lib-sub">{c.description}</span>}
+          </span>
+          <span className="sv-meta"><span>{c.combos} settings</span>ran {date(Date.parse(c.lastRun) / 1000)}</span>
         </button>
       ))}
     </div>
@@ -505,192 +503,3 @@ function Trace() {
     </svg>
   );
 }
-
-/* ============================================================ results */
-
-type ResultsProps = {
-  title: string; bt: Job; sw: Job | null; view: Window; setView: (w: Window) => void;
-  chosen: number | null; rerunning: boolean; onUse: (r: SweepRow) => void; onBack: () => void; error: string | null;
-  labels: Record<string, string>;
-};
-
-function Results({ title, bt, sw, view, setView, chosen, rerunning, onUse, onBack, error, labels }: ResultsProps) {
-  const r = bt.result!;
-  const m = r.metrics![view];
-  const w = r.windows;
-  const range = view === 'test' ? [w.test.start, w.test.end] : view === 'train' ? [w.train.start, w.train.end] : [w.train.start, w.test.end];
-  const sr = sw?.status === 'done' ? sw.result : null;
-  const rows = sr?.top ?? [];
-  const varied = rows.length ? Object.keys(rows[0].params).filter((k) => rows.some((x) => x.params[k] !== rows[0].params[k])) : [];
-  // Short column heads: the spec's label without its parenthetical.
-  const labelOf = (k: string) => (labels[k] ?? k.replace(/_/g, ' ')).replace(/ \(.*\)/, '').replace(/^Minimum trend strength/, 'Min. trend');
-
-  return (
-    <div className="sv-results">
-      <div className="sv-rtop">
-        <button type="button" className="sv-back" onClick={onBack}>
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M10 3L5 8l5 5" /></svg>
-          New test
-        </button>
-        <div className="sv-crumb"><b>{title || r.strategy}</b> · {r.symbol} · {r.timeframe} · data through {date(r.as_of)}
-          {r.adjust !== 'none' ? ` · ${r.adjust}-adjusted` : ''}</div>
-        <span className="sv-chip" title="The Robust / Weak / Overfit verdict arrives with the verdict engine">Unverified</span>
-        <Tabs value={view} onChange={setView} />
-      </div>
-
-      <div className={`sv-hero ${rerunning ? 'dim' : ''}`}>
-        <div>
-          <div className="sv-hlabel">Return on {view === 'test' ? 'the test window' : view === 'train' ? 'the training window' : 'train + test'} · {date(range[0])} – {date(range[1])}</div>
-          <CountUp key={`${bt.id}-${view}`} className={`sv-big ${(m.net_pct ?? 0) >= 0 ? 'good' : 'bad'}`} value={m.net_pct ?? 0} />
-          <div className="sv-vs">vs <span className="mono">{pct(m.bh_pct)}</span> buy &amp; hold · {chosen ? `settings #${chosen}` : 'chosen settings'}</div>
-          <p className="sv-say">{sentence(m, view)}</p>
-        </div>
-        <div className="sv-stats">
-          <Stat label="Max drawdown" value={m.max_dd_pct == null ? '—' : `−${m.max_dd_pct.toFixed(1)}%`} tone="bad" />
-          <Stat label="Sharpe" value={m.sharpe == null ? '—' : m.sharpe.toFixed(2)} />
-          <Stat label="Trades" value={String(m.trades)} />
-          <Stat label="Win rate" value={m.win_pct == null ? '—' : `${m.win_pct.toFixed(0)}%`} />
-          <Stat label="Profit factor" value={m.profit_factor == null ? '—' : m.profit_factor.toFixed(2)} />
-        </div>
-      </div>
-      {m.ruin && <div className="sv-warnline bad">This run lost the whole account. Everything after that point is flat at zero.</div>}
-      {w.thin_sample && <div className="sv-warnline">Less than two years of data. Treat any result here as thin evidence.</div>}
-      {error && <div className="sv-warnline bad">{error}</div>}
-
-      {bt.curve && <EquityChart curve={bt.curve} trainEnd={w.test.start} animateKey={String(bt.id)} />}
-
-      <section className="sv-section">
-        <div className="sv-sech"><h3>Best settings</h3>
-          <p>{sr ? `All ${sr.combos} combinations, ranked on the test window. Train rank alongside, because the two disagreeing is the warning sign.`
-            : sw?.status === 'failed' ? `The sweep failed: ${sw.error}` : 'Still ranking…'}</p></div>
-        {sr && (
-          <div className="sv-best">
-            <div className="sv-tblwrap">
-              <table className="sv-t">
-                <thead><tr><th>#</th>{varied.map((k) => <th key={k}>{labelOf(k)}</th>)}<th>Test return</th><th>Train rank</th><th>Trades</th><th /></tr></thead>
-                <tbody>
-                  {rows.map((row) => (
-                    <tr key={row.test_rank} className={chosen === row.test_rank ? 'sel' : ''}>
-                      <td className="mono">{row.test_rank}</td>
-                      {varied.map((k) => <td key={k} className="mono">{row.params[k]}</td>)}
-                      <td className={`mono ${(row.test.net_pct ?? 0) >= 0 ? 'good' : 'bad'}`}>{pct(row.test.net_pct)}{row.test.ruin ? ' · ruin' : ''}</td>
-                      <td className={`mono ${row.train_rank > row.test_rank + 8 ? 'warn' : ''}`}>{row.train_rank} <span className="dim">of {sr.combos}</span></td>
-                      <td className="mono">{row.test.trades}</td>
-                      <td><button type="button" className="sv-use" disabled={rerunning} onClick={() => onUse(row)}>
-                        {chosen === row.test_rank ? (rerunning ? 'Running…' : 'Using') : 'Use'}</button></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            {sr.ranks && <RankScatter ranks={sr.ranks} combos={sr.combos ?? 0} chosen={chosen} corr={sr.rank_corr ?? null} />}
-          </div>
-        )}
-      </section>
-
-      {bt.trades && <TradeList trades={bt.trades} testStart={w.test.start} />}
-
-      <div className="sv-costnote">
-        Every number above already pays <b>{m.costs?.commission_pct ?? 0}% commission + {m.costs?.slippage_bps ?? 0} bps slippage</b> on
-        both sides of every trade: about {money((m.fees ?? 0) + (m.slippage ?? 0))} on a $10k start
-        ({(m.cost_pct_of_capital ?? 0).toFixed(0)}% of it). Stops the price gaps through fill at the gap, not at the stop.
-      </div>
-    </div>
-  );
-}
-
-function Tabs({ value, onChange }: { value: Window; onChange: (w: Window) => void }) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [ul, setUl] = useState({ left: 0, width: 0 });
-  useLayoutEffect(() => {
-    const on = ref.current?.querySelector<HTMLButtonElement>('button.on');
-    if (on) setUl({ left: on.offsetLeft, width: on.offsetWidth });
-  }, [value]);
-  return (
-    <div className="sv-wtabs" ref={ref}>
-      {(['train', 'test', 'full'] as Window[]).map((v) => (
-        <button key={v} type="button" className={v === value ? 'on' : ''} onClick={() => onChange(v)}>
-          {v === 'full' ? 'Train + test' : v[0].toUpperCase() + v.slice(1)}
-        </button>
-      ))}
-      <span className="sv-ul" style={{ left: ul.left, width: ul.width }} />
-    </div>
-  );
-}
-
-function Stat({ label, value, tone }: { label: string; value: string; tone?: 'bad' }) {
-  return <div className="sv-stat"><small>{label}</small><b className={tone ?? ''}>{value}</b></div>;
-}
-
-function CountUp({ value, className }: { value: number; className: string }) {
-  const [v, setV] = useState(0);
-  useEffect(() => {
-    let raf = 0;
-    const t0 = performance.now();
-    const tick = (now: number) => {
-      const k = Math.min(1, (now - t0) / 1100);
-      setV(value * (1 - (1 - k) ** 3));
-      if (k < 1) raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [value]);
-  return <div className={className}>{pct(v)}</div>;
-}
-
-function TradeList({ trades, testStart }: { trades: Trade[]; testStart: number }) {
-  const [all, setAll] = useState(false);
-  const recent = [...trades].reverse();
-  const shown = all ? recent : recent.slice(0, 14);
-  return (
-    <section className="sv-section">
-      <div className="sv-sech"><h3>Trades</h3><p>{trades.length} over train + test · newest first</p></div>
-      <div className="sv-tblwrap">
-        <table className="sv-t">
-          <thead><tr><th>Entry</th><th>Exit</th><th>Side</th><th>Entry</th><th>Exit</th><th>Why it closed</th><th>P&amp;L</th><th>Window</th></tr></thead>
-          <tbody>
-            {shown.map((t, i) => (
-              <tr key={`${t.entry_ts}-${i}`}>
-                <td className="mono">{date(t.entry_ts)}</td>
-                <td className="mono">{date(t.exit_ts)}</td>
-                <td><span className={`sv-side ${t.side}`}>{t.side}</span></td>
-                <td className="mono">{price(t.entry_px)}</td>
-                <td className="mono">{price(t.exit_px)}</td>
-                <td className="dim">{t.reason === 'end' ? 'still open at the end' : t.reason === 'signal' ? 'exit signal' : t.reason.replace('_', ' ')}</td>
-                <td className={`mono ${t.pnl_pct >= 0 ? 'good' : 'bad'}`}>{pct(t.pnl_pct)}</td>
-                <td className="dim">{t.entry_ts >= testStart ? 'test' : 'train'}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      {trades.length > 14 && <button type="button" className="sv-link" style={{ marginTop: 12 }} onClick={() => setAll(!all)}>
-        {all ? 'Show fewer' : `Show all ${trades.length}`}</button>}
-    </section>
-  );
-}
-
-/* -- words and numbers ---------------------------------------------------------- */
-
-function sentence(m: Metrics, view: Window): string {
-  const where = view === 'train' ? 'the training window' : view === 'test' ? 'data it never saw' : 'train and test together';
-  if (m.ruin) return `Lost the entire account on ${where}. Nothing else here matters.`;
-  const net = m.net_pct ?? 0, bh = m.bh_pct ?? 0;
-  if (net < 0) return `Lost ${pct(net, false)} on ${where}, while simply holding made ${pct(bh)}.`;
-  if (net > bh) return `Beat buy-and-hold by ${Math.round(net - bh).toLocaleString()} points on ${where}, with a worst drop of ${(m.max_dd_pct ?? 0).toFixed(0)}% along the way.`;
-  return `Made ${pct(net)} on ${where}, but simply holding made ${pct(bh)}.`;
-}
-
-function pct(v: number | null | undefined, sign = true): string {
-  if (v == null || !Number.isFinite(v)) return '—';
-  const a = Math.abs(v);
-  const s = a.toLocaleString('en-US', { maximumFractionDigits: a >= 100 ? 0 : 1 });
-  return `${sign ? (v >= 0 ? '+' : '−') : ''}${s}%`;
-}
-function date(ts: number): string {
-  return new Date(ts * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
-}
-function price(v: number): string {
-  return v >= 1000 ? Math.round(v).toLocaleString('en-US') : v >= 10 ? v.toFixed(2) : v.toFixed(4);
-}
-function clamp(v: number, a: number, b: number) { return Math.max(a, Math.min(b, v)); }
