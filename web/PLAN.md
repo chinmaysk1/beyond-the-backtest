@@ -161,8 +161,9 @@ The receding window-less look is a per-candle alpha ramp in the canvas instead,
 which costs nothing and lets the series fade behind the panel. (It is used on
 the landing, under strict limits; see below.)
 
-Panel translucency is **alpha only** (`rgba(23,26,30,0.78)`), no blur, so the
-candles tint the surface they pass under without touching the compositor.
+The market list over the candles is one of the few surfaces that does blur
+(see "Glass" below): the candles move under it when panning, so blur there is
+what makes it read as glass. The chart itself still paints only on change.
 
 TradingView conventions: green up / red down bodies with thin wicks, right-hand
 price axis with gridlines, bottom time axis, dashed last-price line with a
@@ -187,10 +188,68 @@ strip, status badges, coverage meters, bottom metric cards, decorative icon
 buttons. Chrome for features that do not exist is how a prototype starts lying
 about what has been built.
 
-Solid `#0f1114` background, no gradients. Accents are desaturated (`#3f9e74`,
-`#cf5a52`) well past the reference's flat iOS green, because a colour that reads
-calm on white reads lit-up on near-black. Colour appears only where it carries
-state.
+Weeks 5–6 replaced the solid ground with glass on a static space backdrop
+(next section). Accents are softer still (`#7fb89d`, `#c98a84`), because a
+colour that reads calm on white reads lit-up on near-black. The candles are the
+exception: they keep their cleaner `#2f9e79` / `#cf5a52`, which the pastel
+accents made look washed out. Colour appears only
+where it carries state, plus one fixed meaning: buy-and-hold is blue
+(`#6f9bd6`) on every chart.
+
+---
+
+## Glass
+
+Clear glass, faintly tinted pink to yellow (`#f2d2f0` to `#ffe879`), on a
+near-black space backdrop with a few dim stars and two faint patches of colour.
+A surface is three parts: an almost invisible fill, a hairline rim a little
+brighter at the top-left, and a very faint reflection across the top. It all
+lives in `src/app/glass.css`, imported last, as tokens plus one material applied
+to every surface, so no screen hand-tunes its own copy.
+
+**The blur budget.** This replaces the old "no `backdrop-filter`" rule, which
+existed because blur plus a render loop made an earlier prototype unusable.
+Blur re-rasterises whatever is beneath a layer on every paint, so:
+
+- **The backdrop is painted once and is already soft.** Blurring it would change
+  almost nothing, so cards and panels over it are glass *without* blur.
+- **Real blur only over moving, sharp content:** the nav pill, the market list
+  over the candles, menus and tooltips. Never inside a scrolling area: blur
+  there is redrawn on every frame of the scroll, which is why the Results
+  filters panel does not blur.
+- **Cards are cheap glass.** A grid of cards uses an inset hairline for its rim
+  instead of the masked gradient the larger panels use, hover changes one
+  colour with no motion, off-screen cards skip rendering (`content-visibility`),
+  and while the list scrolls the cards ignore the pointer, so a still cursor
+  does not set off a hover repaint on every card passing beneath it.
+- **Effects move only transform and opacity.** No animated gradients; still no
+  render loop on any working screen (the landing's scene is the one exception).
+- **No refraction.** iOS-style lensing needs SVG displacement on the backdrop,
+  which only Chromium supports and which costs far more per frame.
+- **Acceptance:** scrolling the Results grid and a test's page holds 60 fps.
+  Measured with 104 cards in headless Chrome: 240 frames in 4 s, p95 17 ms, one
+  34 ms frame; the test page had none over 20 ms.
+
+On a test's page, glass is only on the stat tiles and the settings table; the
+score row, the charts and the trades sit directly on the backdrop between
+hairlines, so the page does not turn into a stack of boxes.
+
+## Results (Weeks 5–6)
+
+One card per test: strategy, market and timeframe, the score as a ring, the
+test-window return against holding, both curves over the test window (rebased
+to 1, so a line ends where the card's number says), and the settings. The
+filters panel on the left searches, sorts by score / return / vs holding /
+newest, and narrows by minimum score, beat-holding, market and timeframe. A card
+opens the test's page. There is one card per strategy, market and timeframe:
+running the same test again replaces its card with the newest run, and a
+strategy is known by its title, so an edited custom strategy replaces its
+older card too. Unscored tests (still scoring, or a failed sweep) sort
+last under every order but Newest. The list polls while anything is scoring.
+
+The score ring's colour is its calibrated band (`btb/verdict/rules.py` BANDS):
+green from 30, a score luck reaches at most 5% of the time; amber from 12; red
+below.
 
 ---
 
@@ -263,8 +322,8 @@ at 500 combinations in both places.
 
 ## Not built yet
 
-- **Sweeps, Results, Paper trading** — each opens a plain "arrives in weeks
-  N–M" screen, so the product's shape reads without faking what isn't built.
+- **Paper trading** — opens a plain "arrives in weeks 9–12" screen, so the
+  product's shape reads without faking what isn't built.
 - **Deployment.** Runs locally against the tunnel. Production needs the app
   containerised beside Postgres on the Docker network, Caddy for TLS on :80/:443
   (both free on the box), and a domain.

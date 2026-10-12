@@ -19,7 +19,11 @@ export const dynamic = 'force-dynamic';
  * fails fast with a message instead of occupying the queue -- but the worker
  * re-validates all of it, because it is the side spending the CPU.
  *
- *   { kind: "backtest", withSweep: true, strategy | spec | strategyId, symbol, timeframe, costs?, params?, windows? }
+ *   { kind: "backtest", withSweep: true, strategy | spec | strategyId, symbol, timeframe, costs?, params?, windows?, of?, extend? }
+ *
+ * `extend` (a backtest, no sweep) brings one of the user's finished backtests up
+ * to date: the worker reruns only its holdout on the newest bars and writes it
+ * back onto that backtest. The worker checks it is the user's own.
  *
  * `strategy` names a library strategy. `spec` is a user's own JSON strategy:
  * it is stored as a strategies row owned by the user (deduplicated by hash)
@@ -29,7 +33,7 @@ export const dynamic = 'force-dynamic';
  * `windows` moves train and test: { train: [start, end], test: [start, end] },
  * unix seconds. It goes to both jobs, because the sweep ranks on the test
  * window and a ranking from other windows would not describe this run. Checked
- * here against the stored series -- inside it, ordered, clear of the holdout --
+ * here against the stored series -- inside it, ordered, leaving the holdout its minimum --
  * and again, to the bar, by the engine (lib/windows.ts, btb/engine/windows.py).
  *
  * Queue cap: at most MAX_OPEN jobs queued or running per user. A run with its
@@ -42,13 +46,18 @@ const MAX_SLIPPAGE_BPS = 200;
 
 const bad = (error: string, status = 400) => NextResponse.json({ error }, { status });
 
-/* The Results tab: this user's tests, newest first, each with its verdict.
+/* The Results tab: this user's tests, newest first, each with its score.
  *
  * A test is a finished backtest queued with its sweep. Re-runs made from a
  * test's page carry `of` (and a chosen row's carry params), so they are left
  * out -- they are a look at a test, not a new one. The sweep names its
  * backtest in its payload; sweeps queued before that pair by being the next
  * job, which is how they were always created.
+ *
+ * One card per strategy, market and timeframe: running the same test again
+ * replaces its card with the newer run rather than adding a second one. A
+ * strategy is known by its title, so an edited custom strategy (a new stored
+ * version under the same name) also replaces its older card.
  */
 const LISTED = 50;
 const SPARK = 40;
@@ -60,9 +69,11 @@ export async function GET() {
   const tests = (await prisma.jobs.findMany({
     where: { user_id: user.id, kind: 'backtest', status: 'done' },
     orderBy: { id: 'desc' },
-    take: LISTED * 3,
+    take: LISTED * 6,
     select: { id: true, payload: true, result: true, created_at: true },
-  })).filter((j) => !(j.payload as any)?.params && (j.payload as any)?.of == null).slice(0, LISTED);
+  })).filter((j) => !(j.payload as any)?.params && (j.payload as any)?.of == null)
+    .filter(newestOf((j) => { const p = j.payload as any; return `${p.strategy_id ?? p.strategy}|${p.symbol}|${p.timeframe}`; }))
+    .slice(0, LISTED);
   if (!tests.length) return NextResponse.json({ tests: [] });
 
   const lo = tests[tests.length - 1].id;
@@ -77,11 +88,13 @@ export async function GET() {
   }
   const byId = new Map(sweeps.map((s) => [s.id, s]));
 
-  const fullRuns = tests.map((t) => (t.result as any)?.runs?.full).filter((x) => x != null);
+  const drawn = (r: any) => r?.runs?.all ?? r?.runs?.full;
+  const fullRuns = tests.map((t) => drawn(t.result as any)).filter((x) => x != null);
+  type Curve = { ts?: number[]; equity?: number[]; bh?: number[] };
   const curves = new Map((await prisma.runs.findMany({
     where: { id: { in: fullRuns.map((x) => BigInt(x)) } },
     select: { id: true, equity: true },
-  })).map((r) => [Number(r.id), (r.equity as any)?.equity as number[] | undefined]));
+  })).map((r) => [Number(r.id), (r.equity ?? {}) as Curve]));
 
   // Titles, not file names: the library's by name, a user's own by id.
   const pay = tests.map((t) => t.payload as any);
@@ -93,13 +106,15 @@ export async function GET() {
     orderBy: { created_at: 'desc' },
     select: { id: true, name: true, user_id: true, spec: true },
   });
+  const specOf = (p: any) => p.strategy_id ? specs.find((x) => x.id === p.strategy_id)
+    : specs.find((x) => x.user_id === null && x.name === p.strategy);
   const titleOf = (p: any): string | undefined => {
-    const s = p.strategy_id ? specs.find((x) => x.id === p.strategy_id)
-      : specs.find((x) => x.user_id === null && x.name === p.strategy);
+    const s = specOf(p);
     return (s?.spec as any)?.title ?? s?.name;
   };
 
   const out: TestSummary[] = [];
+  const shownKey = newestOf((k: string) => k);
   for (const t of tests) {
     const r = t.result as any;
     const p = t.payload as any;
@@ -110,8 +125,11 @@ export async function GET() {
         && (q.strategy_id ?? q.strategy) === (p.strategy_id ?? p.strategy) ? next : undefined;
     })();
     if (!sw) continue;
+    if (!shownKey(`${titleOf(p) ?? p.strategy_id ?? p.strategy}|${p.symbol}|${p.timeframe}`)) continue;
     const v = (sw.result as any)?.verdict as Verdict | undefined;
+    const scored = sw.status === 'done' && typeof v?.score === 'number';
     const d = r?.default_windows;
+    const test = r?.metrics?.test;
     out.push({
       id: Number(t.id),
       sweepId: Number(sw.id),
@@ -119,17 +137,44 @@ export async function GET() {
       symbol: r?.symbol ?? p.symbol,
       timeframe: r?.timeframe ?? p.timeframe,
       createdAt: t.created_at.toISOString(),
-      testPct: r?.metrics?.test?.net_pct ?? null,
-      bhPct: r?.metrics?.test?.bh_pct ?? null,
+      testPct: test?.net_pct ?? null,
+      bhPct: test?.bh_pct ?? null,
+      maxDd: test?.max_dd_pct ?? null,
       combos: (sw.result as any)?.combos ?? null,
-      label: sw.status === 'done' ? v?.label ?? null : null,
+      params: r?.params ?? {},
+      labels: (specOf(p)?.spec as any)?.labels ?? {},
+      score: scored ? v!.score : null,
+      band: scored ? v!.band : null,
+      reason: scored ? v!.reason : null,
       scoring: sw.status === 'queued' || sw.status === 'running',
+      thin: !!r?.windows?.thin_sample || (v?.checks?.trades?.status === 'warn'),
       custom: !!d && JSON.stringify(d.train) + JSON.stringify(d.test)
         !== JSON.stringify(r.windows?.train) + JSON.stringify(r.windows?.test),
-      spark: thin(curves.get(r?.runs?.full) ?? [], SPARK),
+      spark: testSpark(curves.get(drawn(r)), r?.windows?.test?.start, r?.windows?.test?.end),
     });
   }
   return NextResponse.json({ tests: out });
+}
+
+/* A filter that keeps the first item per key -- with newest-first input, the
+ * newest run of each strategy / market / timeframe. */
+function newestOf<T>(key: (x: T) => string) {
+  const seen = new Set<string>();
+  return (x: T) => { const k = key(x); if (seen.has(k)) return false; seen.add(k); return true; };
+}
+
+/* The card's curve: strategy and buy-and-hold over the test window only, both
+ * rebased to 1, so the line ends where the card's numbers say it does. */
+function testSpark(c: { ts?: number[]; equity?: number[]; bh?: number[] } | undefined, start?: number, end?: number) {
+  const ts = c?.ts ?? [], eq = c?.equity ?? [], bh = c?.bh ?? [];
+  const i0 = Math.max(0, start == null ? 0 : ts.findIndex((t) => t >= start));
+  const after = end == null ? -1 : ts.findIndex((t) => t > end);
+  const i1 = after < 0 ? ts.length : after;
+  const cut = (xs: number[]) => {
+    const ys = xs.slice(i0, i1);
+    return ys.length && ys[0] ? thin(ys.map((y) => y / ys[0]), SPARK) : [];
+  };
+  return { equity: cut(eq), bh: cut(bh) };
 }
 
 function thin(xs: number[], n: number): number[] {
@@ -236,6 +281,12 @@ export async function POST(req: Request) {
   // A re-run made from a test's page names that test, so it stays a view of
   // it rather than a new row in Results.
   if (Number.isSafeInteger(body.of) && body.of > 0) payload.of = body.of;
+  if (body.extend !== undefined) {
+    if (kind !== 'backtest' || withSweep || !Number.isSafeInteger(body.extend) || body.extend < 1) {
+      return bad('extend must be a backtest id, on a backtest without a sweep');
+    }
+    payload.extend = body.extend;
+  }
 
   const need = withSweep ? 2 : 1;
   const open = await prisma.jobs.count({

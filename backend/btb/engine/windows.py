@@ -8,14 +8,19 @@ error; the earlier prototype did exactly that on a 15m series.
     |<------------- train ------------->|<--- test --->|<-- holdout -->|
     first_ts                                                     last_ts
 
-The holdout is the newest data and is excluded from everything by default. It
-is touched once, deliberately, on the one configuration that was chosen. A
-sweep that could see it would make it just another test window.
+The holdout is everything after the test window, up to the newest complete
+bar. Nothing that picks or scores settings reads it: the sweep ranks on test,
+and the verdict scores the default windows. A backtest runs the chosen
+settings over it once, so the page can show how they did on data that came
+after everything they were chosen on. Paper trading then carries on from live.
 
 Train and test can be moved (`custom`): train may start later than the first
-bar, the boundary can slide, and test may end early. The holdout cannot. It is
-always the one `split()` cuts, and a test window that reaches into it is an
-error, not something quietly clipped.
+bar, the boundary can slide, and test may end earlier or later. The holdout
+follows: it always starts on the bar after test ends. Test may not end so late
+that the holdout keeps fewer than MIN_WINDOW_BARS bars.
+
+The verdict's own holdout is the default one, which the moved windows never
+change: the score is always computed on the default train and test.
 """
 from __future__ import annotations
 
@@ -47,6 +52,11 @@ class Split:
     def full(self) -> Window:
         """Train and test together, still excluding the holdout."""
         return Window("full", self.train.start, self.test.end)
+
+    def through(self) -> Window:
+        """Train start to the newest bar: one continuous run whose curve the
+        page draws, with the holdout as its last stretch."""
+        return Window("all", self.train.start, self.holdout.end)
 
     def as_dict(self) -> dict:
         return {"train": self.train.as_dict(), "test": self.test.as_dict(),
@@ -98,9 +108,9 @@ def custom(ts, windows: dict | None, **kw) -> Split:
     bar. Test must begin on the bar right after train ends: a gap between them
     would be data neither window is judged on, for no reason.
 
-    The holdout is `split()`'s, unchanged. None or empty returns `split()`, and
-    so do overrides that snap to exactly the default windows -- a reset is the
-    default run, and dedupes with it.
+    The holdout follows test: it starts on the next bar and runs to the newest.
+    None or empty returns `split()`, and so do overrides that snap to exactly
+    the default windows -- a reset is the default run, and dedupes with it.
     """
     import numpy as np
 
@@ -112,9 +122,9 @@ def custom(ts, windows: dict | None, **kw) -> Split:
     extra = set(windows) - {"train", "test"}
     if extra:
         raise WindowError(f"windows.{sorted(extra)[0]}: unknown window; only train "
-                          "and test can be moved (the holdout never can)")
+                          "and test can be moved (the holdout follows test)")
     ts = np.asarray(ts, dtype="int64")
-    first, last_open = int(ts[0]), base.test.end        # last bar before the holdout
+    first, last_open = int(ts[0]), movable(ts, base)["end"]   # latest test may end
 
     def pair(name):
         v = windows.get(name)
@@ -133,14 +143,15 @@ def custom(ts, windows: dict | None, **kw) -> Split:
             raise WindowError(f"windows.{name}: start is after end")
         if a < first:
             raise WindowError(f"windows.{name}[0]: before the first bar ({_day(first)})")
-    if raw["test"][1] >= base.holdout.start:
-        raise WindowError(f"windows.test[1]: reaches into the holdout, which starts "
-                          f"{_day(base.holdout.start)}; test must end by {_day(last_open)}")
+    if raw["test"][1] > last_open and int(np.searchsorted(ts, raw["test"][1], side="right")) - 1 \
+            > int(np.searchsorted(ts, last_open, side="right")) - 1:
+        raise WindowError(f"windows.test[1]: leaves the holdout fewer than {MIN_WINDOW_BARS} "
+                          f"bars; test must end by {_day(last_open)}")
     if raw["train"][1] >= raw["test"][0]:
         raise WindowError("windows.test[0]: test must start after train ends")
 
-    # Snap: starts forward, ends back. Every value is already inside
-    # [first, last_open], so each lands on a bar in that range or empties.
+    # Snap: starts forward, ends back. Every end is already at or before the
+    # last bar test may take, so each lands on a bar in range or empties.
     def first_at_or_after(t):
         return int(np.searchsorted(ts, t, side="left"))
 
@@ -163,22 +174,28 @@ def custom(ts, windows: dict | None, **kw) -> Split:
         if i1 - i0 + 1 < MIN_WINDOW_BARS:
             raise WindowError(f"windows.{name}: {i1 - i0 + 1} bars; a moved window needs "
                               f"at least {MIN_WINDOW_BARS}")
-    # Belt and braces: nothing above can reach the holdout, and nothing may.
-    assert test.end < base.holdout.start and test.end <= last_open
-    return Split(train, test, base.holdout,
+    # Belt and braces: the holdout keeps its minimum, whatever got through above.
+    assert test.end <= last_open
+    holdout = Window("holdout", int(ts[idx["test"][1] + 1]), int(ts[-1]))
+    return Split(train, test, holdout,
                  thin_sample=base.thin_sample or test.end - train.start < 2 * 365 * DAY)
 
 
 def movable(ts, base: Split) -> dict:
     """What the UI may move train and test within: the first bar through the
-    last bar before the holdout, how many bars that is, and the least a moved
-    window may hold. Lets the chart draw and clamp handles before asking."""
+    latest bar test may end on, how many bars that is, and the least a moved
+    window may hold. Lets the chart draw and clamp handles before asking.
+
+    Test may run into the default holdout as long as MIN_WINDOW_BARS bars stay
+    after it. A series whose default holdout is already shorter than that keeps
+    the default test end as the limit."""
     import numpy as np
 
     ts = np.asarray(ts, dtype="int64")
-    bars = int(np.searchsorted(ts, base.test.end, side="right"))
-    return {"start": int(ts[0]), "end": base.test.end, "bars": bars,
-            "min_bars": MIN_WINDOW_BARS}
+    end = max(base.test.end, int(ts[-1 - MIN_WINDOW_BARS])) if len(ts) > MIN_WINDOW_BARS + 1 \
+        else base.test.end
+    bars = int(np.searchsorted(ts, end, side="right"))
+    return {"start": int(ts[0]), "end": end, "bars": bars, "min_bars": MIN_WINDOW_BARS}
 
 
 def _day(t: int) -> str:

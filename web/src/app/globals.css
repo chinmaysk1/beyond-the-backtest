@@ -17,10 +17,11 @@
  * version holds to that; the accents here are desaturated further, because a
  * colour that reads as calm on white reads as lit-up on near-black.
  *
- * Performance: no backdrop-filter, no animated gradients, no continuous
- * animation. The previous prototype used all three and dropped frames on every
- * interaction. Transitions are short, and only on properties the compositor
- * handles cheaply (opacity, transform, background-color).
+ * Performance: no animated gradients, no continuous animation, and blur only
+ * within the budget in glass.css (which also sets how surfaces look). The
+ * previous prototype blurred everything under a render loop and dropped frames
+ * on every interaction. Transitions are short, and only on properties the
+ * compositor handles cheaply (opacity, transform, background-color).
  */
 
 :root {
@@ -453,37 +454,4 @@ input { font: inherit; color: inherit; }
   height: 100%;
   color: var(--text-3);
   font-size: 12px;
-}
-
-
-/* -- scale toggle --------------------------------------------------------- */
-
-/* Lives in the empty corner where the price axis meets the time axis -- the
-   same place TradingView puts it -- so it never sits on top of the candles.
-   That corner is only PAD_RIGHT x PAD_BOTTOM (62 x 26px), which is why this is
-   one compact toggle rather than two labelled buttons: two would not fit, and
-   floating them over the plot is what was overflowing. */
-.scale-toggle {
-  position: absolute;
-  right: 24px;
-  bottom: 22px;
-  z-index: 2;
-  width: 54px;
-  height: 20px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 5px;
-  background: var(--panel);
-  border: 1px solid var(--border-soft);
-  color: var(--text-3);
-  font-size: 9.5px;
-  letter-spacing: 0.04em;
-  transition: background-color 0.16s var(--ease), color 0.16s var(--ease);
-}
-.scale-toggle:hover { color: var(--text-2); }
-.scale-toggle.on {
-  background: var(--panel-hi);
-  border-color: var(--border);
-  color: var(--text);
 }

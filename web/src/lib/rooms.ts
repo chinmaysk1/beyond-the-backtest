@@ -20,7 +20,7 @@ export const ROOMS: Room[] = [
     desc: 'Pick an idea, or write your own, and test it properly.',
     icon: 'M4 17l5-5 4 4 7-8M15 8h5v5' },
   { id: 'results', title: 'Results', live: true,
-    desc: 'Every test, its verdict, and every setting it tried.',
+    desc: 'Every test, its score, and every setting it tried.',
     icon: 'M5 12l4 4L19 6' },
   { id: 'paper', title: 'Paper trading', live: false,
     desc: 'Live prices, pretend money, before real money.',

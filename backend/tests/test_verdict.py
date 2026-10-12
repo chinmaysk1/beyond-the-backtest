@@ -5,13 +5,16 @@ Each check is pinned against a case whose answer is known before it runs:
     test_dsr_matches_paper_example        Bailey & Lopez de Prado's worked example
     test_pbo_*                            noise ~0.5, a planted edge ~0, no trades -> None
     test_walk_forward_never_looks_ahead   a fold's pick ignores every later day
-    test_label_*                          the rule table, including thin evidence
+    test_score_*                          the formula: bounds, vetoes, missing checks
+    test_reason_*                         the sentence still names the weakest check
+    test_rescore_matches_a_fresh_score    stored numbers re-score to the same values
     test_verdict_ignores_the_holdout      rewriting the newest year changes nothing
     test_verdict_is_deterministic
-    test_random_walks_are_not_robust      the false-positive guard, small version
+    test_random_walks_do_not_score_high   the false-positive guard, small version
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 from pathlib import Path
@@ -94,27 +97,65 @@ def _checks(pbo=0.1, wf=10.0, pos=5, d=0.99, trades=100, thin=False):
     return {**g, **rules.row_checks({"value": d, "trials": 81}, trades)}
 
 
-@pytest.mark.parametrize("kw,label", [
-    ({}, "ROBUST"),
-    ({"pbo": 0.6}, "OVERFIT"),
-    ({"wf": -1.0}, "OVERFIT"),
-    ({"d": 0.3}, "OVERFIT"),
-    ({"pbo": 0.3}, "WEAK"),
-    ({"d": 0.8}, "WEAK"),
-    ({"pos": 2}, "WEAK"),
-    ({"trades": 10}, "WEAK"),
-    ({"thin": True}, "WEAK"),
-])
-def test_label_rules(kw, label):
-    c = _checks(**kw)
-    assert rules.label(c) == label
-    assert rules.reason(c)
+def test_score_is_the_product_of_its_factors():
+    c = _checks(pbo=0.2, pos=4, d=0.9)
+    f = rules.factors(c)
+    assert f == {"dsr": 0.9, "pbo": 0.8, "walk_forward": round(5 / 7, 4)}
+    assert rules.score(c) == round(100 * 0.9 * 0.8 * 5 / 7)
 
 
-def test_label_missing_check_is_never_robust():
+@pytest.mark.parametrize("kw", [{"d": 0.0}, {"pbo": 1.0}])
+def test_score_any_factor_at_zero_vetoes_it(kw):
+    assert rules.score(_checks(**kw)) == 0
+
+
+def test_score_is_bounded_and_monotone():
+    best = rules.score(_checks(pbo=0.0, pos=5, d=1.0))
+    assert best == round(100 * 6 / 7) and 0 <= best <= 100
+    assert rules.score(_checks(d=0.8)) < rules.score(_checks(d=0.95))
+    assert rules.score(_checks(pbo=0.4)) < rules.score(_checks(pbo=0.1))
+    assert rules.score(_checks(pos=2)) < rules.score(_checks(pos=5))
+
+
+def test_score_missing_checks_count_as_no_evidence():
     g = rules.grid_checks(None, None, years=5, thin=False)
     c = {**g, **rules.row_checks({"value": 0.99, "trials": 8}, 100)}
-    assert rules.label(c) == "WEAK"
+    assert rules.factors(c) == {"dsr": 0.99, "pbo": 0.5, "walk_forward": 0.5}
+    assert rules.band(rules.score(c)) != "high"
+    c["dsr"] = {"status": "na", "value": None, "trials": 8}
+    assert rules.score(c) == 0
+
+
+def test_band_edges():
+    assert rules.band(rules.BANDS["high"]) == "high"
+    assert rules.band(rules.BANDS["high"] - 1) == "mid"
+    assert rules.band(rules.BANDS["mid"]) == "mid"
+    assert rules.band(rules.BANDS["mid"] - 1) == "low"
+
+
+@pytest.mark.parametrize("kw,word", [
+    ({"pbo": 0.6}, "bottom half"),
+    ({"wf": -1.0}, "real time"),
+    ({"d": 0.3}, "luck"),
+    ({"trades": 10}, "trades"),
+    ({}, "every check"),
+])
+def test_reason_names_the_weakest_check(kw, word):
+    assert word in rules.reason(_checks(**kw))
+
+
+def test_rescore_matches_a_fresh_score(btc):
+    s = spec("ema_cross_adx")
+    series = B.Series.from_frame(btc, "4h")
+    v = V.evaluate(s, series, COSTS, JB.sweep_series(s, series, COSTS))
+    old = {**copy.deepcopy(v), "label": "WEAK", "version": 1}
+    for r in old["rows"].values():
+        for k in ("score", "band"):
+            r.pop(k)
+    new = V.rescore(old)
+    assert "label" not in new and new["version"] == rules.VERSION
+    assert (new["score"], new["band"], new["factors"]) == (v["score"], v["band"], v["factors"])
+    assert {k: r["score"] for k, r in new["rows"].items()} ==         {k: r["score"] for k, r in v["rows"].items()}
 
 
 def test_verdict_ignores_the_holdout(btc):
@@ -137,13 +178,13 @@ def test_verdict_is_deterministic_and_complete(btc):
     a, b = V.evaluate(s, series, COSTS, sw), V.evaluate(s, series, COSTS, sw)
     a.pop("seconds"), b.pop("seconds")
     assert a == b
-    assert a["label"] in rules.ORDER and a["reason"]
+    assert 0 <= a["score"] <= 100 and a["band"] in ("high", "mid", "low") and a["reason"]
     assert set(a["checks"]) == {"walk_forward", "pbo", "sample", "dsr", "trades"}
-    assert a["rows"]["1"]["label"] == a["label"]
+    assert a["rows"]["1"]["score"] == a["score"] and "label" not in a
     assert json.dumps(a)                      # stored as jsonb
 
 
-def test_random_walks_are_not_robust(btc):
+def test_random_walks_do_not_score_high(btc):
     # The full calibration (50 walks x every strategy) is a CLI run; this is the
     # small always-on version: 5 random walks with BTC-like volatility.
     s = spec("ema_cross")
@@ -153,4 +194,4 @@ def test_random_walks_are_not_robust(btc):
         c = 100 * np.exp(np.cumsum(rng.normal(0, 0.02, len(ts))))
         df = pd.DataFrame({"ts": ts, "open": c, "high": c * 1.01, "low": c * 0.99,
                            "close": c, "volume": 1.0})
-        assert V.evaluate(s, B.Series.from_frame(df, "4h"), COSTS)["label"] != "ROBUST"
+        assert V.evaluate(s, B.Series.from_frame(df, "4h"), COSTS)["band"] != "high"

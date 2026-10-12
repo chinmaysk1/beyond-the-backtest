@@ -3,6 +3,7 @@ import { Poppins, Sora, Unbounded } from 'next/font/google';
 
 import './globals.css';
 import './experience.css';
+import './glass.css';
 
 /* A geometric sans with a SINGLE-STOREY 'a' and circular bowls, matching the
  * reference. Inter was the wrong call: its 'a' is double-storey, which is the

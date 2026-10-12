@@ -1,7 +1,7 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 import type { Bar } from '../lib/adjust';
 import { flyCards, flyTitle } from '../lib/flight';
@@ -220,6 +220,25 @@ export default function Dashboard({ username }: { username: string }) {
 
   const shown = hovered ?? bars[bars.length - 1] ?? null;
 
+  /* The active tab's highlight is one pill that slides between tabs rather
+   * than each tab lighting up on its own. Placed without a transition the
+   * first time (and after a resize), so it never sweeps in from the left. */
+  const tabsBox = useRef<HTMLDivElement>(null);
+  const [pill, setPill] = useState<{ left: number; width: number; slide: boolean } | null>(null);
+  useLayoutEffect(() => {
+    const place = (slide: boolean) => {
+      const el = tabsRef.current[ROOMS.findIndex((r) => r.id === tab)];
+      if (!el) { setPill(null); return; }
+      setPill((p) => ({ left: el.offsetLeft, width: el.offsetWidth, slide: slide && !!p }));
+    };
+    place(true);
+    // A new observer reports once straight away; only later reports are resizes.
+    let first = true;
+    const ro = new ResizeObserver(() => { if (first) first = false; else place(false); });
+    if (tabsBox.current) ro.observe(tabsBox.current);
+    return () => ro.disconnect();
+  }, [tab, stage]);
+
   return (
     <>
     <Landing stage={stage} onChoose={enter} cardsRef={cardsRef} titleRef={titleRef} />
@@ -227,7 +246,9 @@ export default function Dashboard({ username }: { username: string }) {
       <nav className="nav">
         <Brand onClick={home} wordRef={brandRef} />
 
-        <div className="tabs">
+        <div className="tabs" ref={tabsBox}>
+          {pill && <span className={`tabs-pill ${pill.slide ? 'slide' : ''}`} aria-hidden="true"
+                         style={{ left: pill.left, width: pill.width }} />}
           {ROOMS.map((r, i) => (
             <button
               key={r.id}
@@ -282,6 +303,15 @@ export default function Dashboard({ username }: { username: string }) {
         </div>
 
         <div className="head-right">
+          {/* Its own switch in the header: the chart's corner is too small for
+              it once the last date label reaches into it. */}
+          <div className="seg" role="group" aria-label="Price scale">
+            {(['linear', 'log'] as const).map((s) => (
+              <button key={s} type="button" className={scale === s ? 'on' : ''} onClick={() => setScale(s)}>
+                {s === 'log' ? 'Log' : 'Linear'}
+              </button>
+            ))}
+          </div>
           <div className="seg">
             {ADJUSTMENTS.map((a) => (
               <button
@@ -324,16 +354,6 @@ export default function Dashboard({ username }: { username: string }) {
           </div>
         </div>
 
-        <button
-          type="button"
-          className={`scale-toggle ${scale === 'log' ? 'on' : ''}`}
-          onClick={() => setScale(scale === 'log' ? 'linear' : 'log')}
-          title={scale === 'log'
-            ? 'Logarithmic scale — click for linear'
-            : 'Linear scale — click for logarithmic'}
-        >
-          {scale === 'log' ? 'LOG' : 'LINEAR'}
-        </button>
       </div>
       </>)}
       </div>

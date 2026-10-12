@@ -17,7 +17,7 @@ import { moveHandle, type Handles, type Movable } from '../lib/windows';
  *
  * With `windows`, the axis spans the whole series instead of the curve, and
  * three handles move train start, the train/test boundary and test end. The
- * holdout is drawn, locked, past the last one. The chart only reports moves:
+ * holdout is everything past the last one, and moves with it. The chart only reports moves:
  * `onChange` on every step for instant feedback, `onCommit` on release or key,
  * which is when the caller asks the engine for real numbers. Handles are DOM
  * sliders over the canvas, so pointer, touch and keyboard all work.
@@ -26,7 +26,7 @@ import { moveHandle, type Handles, type Movable } from '../lib/windows';
 export type WindowHandles = {
   value: Handles;                        // train start, test start, test end
   movable: Movable;
-  holdout: [number, number];
+  holdout: [number, number];             // after test end to the newest bar
   step: number;                          // one bar, in seconds
   onChange: (h: Handles) => void;
   onCommit: (h: Handles) => void;
@@ -110,24 +110,19 @@ export default function EquityChart({ curve, trainEnd, capital = 10_000, animate
     const y = (v: number) => PAD.t + (1 - (f(v) - ylo) / (yhi - ylo)) * H;
 
     if (windows && wv) {
-      // Train shaded as before; the holdout hatched and labelled locked.
+      // Train shaded as before; the holdout -- everything after the test-end
+      // handle -- tinted blue-grey and labelled. It follows the handle.
       const [a, b] = [xt(wv[0]), xt(wv[1])];
       g.fillStyle = 'rgba(255,255,255,0.022)';
       g.fillRect(a, PAD.t, b - a, H);
-      const hx = xt(windows.holdout[0]);
-      g.save();
-      g.beginPath(); g.rect(hx, PAD.t, W - hx, H); g.clip();
-      g.strokeStyle = '#1b1f24';
-      for (let i = hx - H; i < W; i += 7) { g.beginPath(); g.moveTo(i, PAD.t + H); g.lineTo(i + H, PAD.t); g.stroke(); }
-      g.restore();
-      g.strokeStyle = '#2a2f36';
-      g.beginPath(); g.moveTo(Math.round(hx) + 0.5, PAD.t); g.lineTo(Math.round(hx) + 0.5, PAD.t + H); g.stroke();
+      const hx = xt(wv[2]);
+      g.fillStyle = 'rgba(111,155,214,0.05)';
+      g.fillRect(hx, PAD.t, W - hx, H);
       g.fillStyle = '#656c74';
       g.font = '10.5px system-ui, sans-serif';
       g.fillText('TRAIN', a + 12, PAD.t + 16);
       g.fillText('TEST', b + 12, PAD.t + 16);
-      const tag = W - hx > g.measureText('HOLDOUT · LOCKED').width + 16 ? 'HOLDOUT · LOCKED' : 'HOLDOUT';
-      if (W - hx > g.measureText(tag).width + 16) g.fillText(tag, hx + 10, PAD.t + 16);
+      if (W - hx > g.measureText('HOLDOUT').width + 16) g.fillText('HOLDOUT', hx + 10, PAD.t + 16);
     } else if (trainEnd && trainEnd > t0) {
       const tx = Math.min(xt(trainEnd), W);
       g.fillStyle = 'rgba(255,255,255,0.022)';
@@ -170,23 +165,22 @@ export default function EquityChart({ curve, trainEnd, capital = 10_000, animate
       for (let i = 0; i < m; i++) { const px = x(i), py = y(Math.max(arr[i], lo)); i ? g.lineTo(px, py) : g.moveTo(px, py); }
     };
     trace(curve.bh);
-    g.strokeStyle = '#4b535c'; g.lineWidth = 1.2; g.stroke();
+    g.strokeStyle = '#6f9bd6'; g.lineWidth = 1.3; g.stroke();
     // soft fill under the strategy line
     trace(curve.equity);
     g.lineTo(x(m - 1), PAD.t + H); g.lineTo(x(0), PAD.t + H); g.closePath();
     const grad = g.createLinearGradient(0, PAD.t, 0, PAD.t + H);
-    grad.addColorStop(0, 'rgba(231,233,236,0.08)'); grad.addColorStop(1, 'rgba(231,233,236,0)');
+    grad.addColorStop(0, 'rgba(127,184,157,0.09)'); grad.addColorStop(1, 'rgba(127,184,157,0)');
     g.fillStyle = grad; g.fill();
     trace(curve.equity);
-    g.strokeStyle = '#e7e9ec'; g.lineWidth = 1.7; g.stroke();
+    g.strokeStyle = '#7fb89d'; g.lineWidth = 1.7; g.stroke();
     g.lineWidth = 1;
 
     if (windows && wv) {
-      // Outside train and test: drawn over, so a curve from wider windows
-      // visibly stops counting where the handles now are.
-      g.fillStyle = 'rgba(15,17,20,0.72)';
+      // Before train start: drawn over, so a curve from wider windows visibly
+      // stops counting where the handle now is. After test end is the holdout.
+      g.fillStyle = 'rgba(5,6,9,0.72)';
       g.fillRect(0, PAD.t - 2, xt(wv[0]), H + 4);
-      g.fillRect(xt(wv[2]), PAD.t - 2, xt(windows.holdout[0]) - xt(wv[2]), H + 4);
     }
 
     if (k < 1) {
@@ -198,7 +192,7 @@ export default function EquityChart({ curve, trainEnd, capital = 10_000, animate
       const hx = Math.round(x(hover)) + 0.5;
       g.strokeStyle = '#39414a';
       g.beginPath(); g.moveTo(hx, PAD.t); g.lineTo(hx, PAD.t + H); g.stroke();
-      for (const [arr, c] of [[curve.equity, '#e7e9ec'], [curve.bh, '#9aa1a9']] as const) {
+      for (const [arr, c] of [[curve.equity, '#7fb89d'], [curve.bh, '#6f9bd6']] as const) {
         g.fillStyle = c; g.beginPath(); g.arc(hx, y(Math.max(arr[hover], lo)), 3, 0, 7); g.fill();
       }
     }
@@ -262,8 +256,8 @@ export default function EquityChart({ curve, trainEnd, capital = 10_000, animate
   return (
     <div className="eq">
       <div className="eq-legend">
-        <span><i style={{ background: '#e7e9ec' }} />Strategy</span>
-        <span><i style={{ background: '#4b535c' }} />Buy &amp; hold</span>
+        <span><i style={{ background: '#7fb89d' }} />Strategy</span>
+        <span><i style={{ background: '#6f9bd6' }} />Buy &amp; hold</span>
         <span className="eq-dim">{log ? 'log scale · ' : ''}{windows ? 'drag the lines to move train and test' : 'shaded = training window'}</span>
         <span className="eq-read mono">
           {previewing ? (

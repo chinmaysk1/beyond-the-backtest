@@ -7,6 +7,7 @@
     sweep  --strategy S --symbol X --timeframe T [--csv FILE] [--save]
     verdict --strategy S --symbol X --timeframe T [--csv FILE]
     calibrate --timeframe T [--csv FILE | --symbol X] [--walks N] [--strategy S ...]
+    rescore [--dry-run] [--force]  re-score stored verdicts from their stored numbers
     enqueue backtest|sweep --strategy S --symbol X --timeframe T [--param k=v ...]
     worker [--no-refresh] [--once]
     refresh                       fetch newly closed bars for every due series, once
@@ -158,33 +159,36 @@ def cmd_verdict(args) -> int:
                    fill=args.fill)
     _print_verdict(args.strategy, v)
     for rank, r in v["rows"].items():
-        print(f"  #{rank:<3} {r['label']:<8} dsr {r['dsr']}  {json.dumps(r['params'])}")
+        print(f"  #{rank:<3} score {r['score']:>3}  dsr {r['dsr']}  {json.dumps(r['params'])}")
     return 0
 
 
 def _print_verdict(name: str, v: dict) -> None:
-    c = v["checks"]
+    c, f = v["checks"], v["factors"]
     wf, pb = c["walk_forward"], c["pbo"]
-    print(f"{name:<20} {v['label']:<8} {v['combos']:>3} settings  "
-          f"pbo {pb.get('value', '-')}  "
-          f"walk-forward {wf.get('oos_pct', '-')}% ({wf.get('folds_positive', '-')}/5 up, "
-          f"hold {wf.get('bh_pct', '-')}%)  dsr {c['dsr']['value']}  [{v['seconds']}s]")
+    print(f"{name:<20} score {v['score']:>3} = {f['dsr']:.2f} x {f['pbo']:.2f} x "
+          f"{f['walk_forward']:.2f}  ({v['combos']} settings; pbo {pb.get('value', '-')}, "
+          f"walk-forward {wf.get('oos_pct', '-')}% with {wf.get('folds_positive', '-')}/5 up "
+          f"vs hold {wf.get('bh_pct', '-')}%)  [{v['seconds']}s]")
     print(f"{'':<20} {v['reason']}")
 
 
 def cmd_calibrate(args) -> int:
-    """Run the verdict on random walks, where no strategy has an edge, with the
-    real series' timestamps and volatility. ROBUST here is a false positive;
-    the target is at most 5% of runs."""
+    """Score random walks, where no strategy has an edge, with the real
+    series' timestamps and volatility. The distribution of headline scores is
+    what luck alone produces: its 95th percentile is where `high` should start
+    and its 75th where `mid` should. A walk scoring `high` under the current
+    bands is a false positive; the target is at most 5% of runs."""
     import numpy as np
     from .. import verdict as V
+    from ..verdict import rules
     from .jobs import sweep_series
     real = _series(args)
     close = real.frame.close
     vol = float(np.std(np.diff(np.log(close))))
     names = args.strategy or sorted(L.load_all())
     rng = np.random.default_rng(args.seed)
-    counts = {n: {"ROBUST": 0, "WEAK": 0, "OVERFIT": 0} for n in names}
+    scores = {n: [] for n in names}
     for i in range(args.walks):
         c = close[0] * np.exp(np.cumsum(rng.normal(0, vol, len(close))))
         df = pd.DataFrame({"ts": real.ts, "open": c, "high": c * (1 + vol), "low": c * (1 - vol),
@@ -194,15 +198,49 @@ def cmd_calibrate(args) -> int:
         for n in names:
             spec = L.get(n)
             v = V.evaluate(spec, walk, costs, sweep_series(spec, walk, costs), fill=args.fill)
-            counts[n][v["label"]] += 1
+            scores[n].append(v["score"])
         print(f"walk {i + 1}/{args.walks}", file=sys.stderr)
-    total = sum(c["ROBUST"] for c in counts.values())
-    runs = args.walks * len(names)
-    print(f"{'strategy':<20} robust  weak  overfit   ({args.walks} random walks, vol {vol:.4f}/bar)")
-    for n, c in counts.items():
-        print(f"{n:<20} {c['ROBUST']:>6} {c['WEAK']:>5} {c['OVERFIT']:>8}")
-    print(f"false-positive rate: {total}/{runs} = {total / runs:.1%} (target <= 5%)")
-    return 0 if total / runs <= 0.05 else 1
+    hi = rules.BANDS["high"]
+    print(f"{'strategy':<20} median  p75  p95  max  >={hi}   ({args.walks} random walks, vol {vol:.4f}/bar)")
+    for n, xs in scores.items():
+        q = np.percentile(xs, [50, 75, 95])
+        print(f"{n:<20} {q[0]:>6.0f} {q[1]:>4.0f} {q[2]:>4.0f} {max(xs):>4} {sum(x >= hi for x in xs):>5}")
+    every = [x for xs in scores.values() for x in xs]
+    q = np.percentile(every, [75, 95])
+    fp = sum(x >= hi for x in every)
+    print(f"all runs: p75 {q[0]:.0f} (mid should start here), p95 {q[1]:.0f} (high should start here)")
+    print(f"false-positive rate at high >= {hi}: {fp}/{len(every)} = {fp / len(every):.1%} (target <= 5%)")
+    if args.out:
+        Path(args.out).write_text(json.dumps({"timeframe": real.timeframe, "vol": vol,
+                                              "walks": args.walks, "scores": scores}))
+    return 0 if fp / len(every) <= 0.05 else 1
+
+
+def cmd_rescore(args) -> int:
+    """Re-score every stored verdict under the current rules, from the numbers
+    it already holds. Nothing is re-run; verdicts already at this version are
+    left alone unless --force."""
+    from psycopg.types.json import Jsonb
+    from .. import db
+    from .. import verdict as V
+    from ..verdict import rules
+    n = 0
+    with db.connect() as conn:
+        rows = conn.execute("SELECT id, result->'verdict' FROM jobs "
+                            "WHERE kind = 'sweep' AND result ? 'verdict'").fetchall()
+        for jid, v in rows:
+            if not v or (v.get("version") == rules.VERSION and not args.force):
+                continue
+            new = V.rescore(v)
+            if not args.dry_run:
+                conn.execute("UPDATE jobs SET result = jsonb_set(result, '{verdict}', %s) "
+                             "WHERE id = %s", (Jsonb(new), jid))
+            print(f"job {jid}: {v.get('label', '-')} -> score {new['score']}")
+            n += 1
+        if not args.dry_run:
+            conn.commit()
+    print(f"{'would rescore' if args.dry_run else 'rescored'} {n} of {len(rows)} stored verdicts")
+    return 0
 
 
 def cmd_enqueue(args) -> int:
@@ -272,11 +310,11 @@ def main(argv=None) -> int:
     s.add_argument("--save", action="store_true", help="record runs in the database")
     s.set_defaults(fn=cmd_sweep)
 
-    vd = sub.add_parser("verdict", help="sweep, then ROBUST / WEAK / OVERFIT and why")
+    vd = sub.add_parser("verdict", help="sweep, then a 0-100 score and why")
     market(vd)
     vd.set_defaults(fn=cmd_verdict)
 
-    cb = sub.add_parser("calibrate", help="false-positive rate of the verdict on random walks")
+    cb = sub.add_parser("calibrate", help="what scores luck alone reaches, on random walks")
     cb.add_argument("--strategy", action="append", help="repeatable; default every library strategy")
     cb.add_argument("--symbol")
     cb.add_argument("--timeframe", required=True)
@@ -287,7 +325,13 @@ def main(argv=None) -> int:
     cb.add_argument("--asset-class", default="crypto", choices=["crypto", "equity"])
     cb.add_argument("--walks", type=int, default=50)
     cb.add_argument("--seed", type=int, default=0)
+    cb.add_argument("--out", help="write every walk's score to this JSON file")
     cb.set_defaults(fn=cmd_calibrate)
+
+    rs = sub.add_parser("rescore", help="re-score stored verdicts under the current rules")
+    rs.add_argument("--dry-run", action="store_true")
+    rs.add_argument("--force", action="store_true", help="also verdicts already at this version")
+    rs.set_defaults(fn=cmd_rescore)
 
     e = sub.add_parser("enqueue", help="queue a job for the worker")
     e.add_argument("kind", choices=["backtest", "sweep"])
