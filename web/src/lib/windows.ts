@@ -11,7 +11,8 @@
  * Three handles: train start (a), the boundary (b, test's first bar) and test
  * end (c). Train and test stay contiguous -- train ends on the bar before b --
  * so the payload is derived from those three numbers rather than chosen freely.
- * The holdout is never movable: c stops at the last bar before it.
+ * The holdout follows c: it is everything after test, up to the newest bar, and
+ * c stops where it would keep fewer than MIN_WINDOW_BARS bars (movable.end).
  */
 
 export const DAY = 86400;
@@ -34,12 +35,6 @@ export function toSpans([a, b, c]: Handles): WindowSpans {
   return { train: [a, b - 1], test: [b, c] };
 }
 
-/* Where split() puts the holdout, from a series' first and newest bar. The
- * holdout's first bar is the first one after this instant. */
-export function holdoutFrom(first: number, last: number): number {
-  return last - Math.min(365 * DAY, (last - first) * 0.25);
-}
-
 /* Least span a moved window should cover, from the average bar spacing. A
  * little over the engine's bar minimum, so a window the handles allow is not
  * refused for being a few bars short where the market was closed. */
@@ -54,7 +49,7 @@ export function canMove(m: Movable | undefined | null): m is Movable {
 }
 
 /* Move one handle to `t`, snapped to the bar grid and clamped so every window
- * keeps its minimum and test never passes the last bar before the holdout. */
+ * keeps its minimum, the holdout after test included. */
 export function moveHandle(h: Handles, which: 0 | 1 | 2, t: number, m: Movable, step: number): Handles {
   const span = minSpan(m);
   const snap = (v: number) => m.start + Math.round((v - m.start) / step) * step;
@@ -81,7 +76,7 @@ export function checkWindows(
   const bad = (error: string): Check => ({ ok: false, error });
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return bad('windows: must be an object with train and test');
   const extra = Object.keys(raw).find((k) => k !== 'train' && k !== 'test');
-  if (extra) return bad(`windows.${extra}: unknown window; only train and test can be moved (the holdout never can)`);
+  if (extra) return bad(`windows.${extra}: unknown window; only train and test can be moved (the holdout follows test)`);
   const out: Partial<WindowSpans> = {};
   for (const name of ['train', 'test'] as const) {
     const v = (raw as any)[name];
@@ -96,8 +91,12 @@ export function checkWindows(
     out[name] = [v[0], v[1]];
   }
   const w = out as WindowSpans;
-  const hold = holdoutFrom(series.first, series.last);
-  if (w.test[1] > hold) return bad(`windows.test[1]: reaches into the holdout, which starts after ${day(hold)}`);
+  // The holdout keeps at least MIN_WINDOW_BARS bars. Counted in time here (the
+  // engine counts real bars and is the stricter check where markets close).
+  const keep = MIN_WINDOW_BARS * (TF_SECONDS[series.timeframe] ?? 0);
+  if (w.test[1] > series.last - keep) {
+    return bad(`windows.test[1]: leaves the holdout fewer than ${MIN_WINDOW_BARS} bars; test must end by ${day(series.last - keep)}`);
+  }
   if (w.train[1] >= w.test[0]) return bad('windows.test[0]: test must start after train ends');
   // A window of n bars spans at least n - 1 bar lengths; anything shorter
   // cannot hold the minimum. The engine counts the actual bars.

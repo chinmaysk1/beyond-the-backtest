@@ -13,7 +13,7 @@ made, or a bug that actually occurred while building this:
     test_out_key_is_not_a_reference       bbands out:"upper" read as a cycle
     test_partial_bar_is_never_read        the forming bar stays out of research
     test_sweep_resumes_without_rerunning  recorded work is recognised
-    test_moved_windows_never_reach_*      the holdout survives user-chosen windows
+    test_moved_holdout_follows_test       the holdout is everything after test, kept to a minimum
 """
 from __future__ import annotations
 
@@ -296,7 +296,7 @@ def test_moved_windows_snap_to_bars_and_stay_contiguous(btc):
                        "test": [int(ts[1500]) - 6, int(ts[3000]) + 9]})
     assert (mv.train.start, mv.train.end) == (ts[201], ts[1499])
     assert (mv.test.start, mv.test.end) == (ts[1500], ts[3000])
-    assert mv.holdout == sp.holdout
+    assert (mv.holdout.start, mv.holdout.end) == (ts[3001], ts[-1])
     assert mv.full().start == mv.train.start and mv.full().end == mv.test.end
 
 
@@ -309,17 +309,24 @@ def test_default_windows_come_back_as_the_default_split(btc):
     assert W.custom(ts, same) == sp                  # a reset dedupes with the default run
 
 
-def test_moved_windows_never_reach_the_holdout(btc):
+def test_moved_holdout_follows_test(btc):
     ts = btc["ts"].to_numpy()
     sp = W.split(ts)
-    for end in (sp.holdout.start, sp.holdout.start + 1, sp.holdout.end, int(ts[-1]) + 10**6):
-        with pytest.raises(W.WindowError, match=r"^windows\.test\[1\]: reaches into the holdout"):
+    limit = W.movable(ts, sp)["end"]
+    assert limit == int(ts[-1 - W.MIN_WINDOW_BARS]) > sp.test.end
+    # Test ending earlier: the holdout grows back to the bar after it.
+    early = W.custom(ts, _moved(sp, ts, end=int(ts[3000])))
+    assert (early.holdout.start, early.holdout.end) == (ts[3001], ts[-1])
+    # Later, into the default holdout: allowed while the minimum stays after it.
+    late = W.custom(ts, _moved(sp, ts, end=limit))
+    assert late.test.end == limit and late.holdout.start == ts[-W.MIN_WINDOW_BARS]
+    assert np.searchsorted(ts, late.holdout.end) - np.searchsorted(ts, late.holdout.start) + 1 \
+        == W.MIN_WINDOW_BARS
+    # Off-bar, between the limit and the next bar: snaps back to the limit.
+    assert W.custom(ts, _moved(sp, ts, end=limit + 1)).test.end == limit
+    for end in (int(ts[-W.MIN_WINDOW_BARS]), int(ts[-1]), int(ts[-1]) + 10**6):
+        with pytest.raises(W.WindowError, match=r"^windows\.test\[1\]: leaves the holdout fewer than"):
             W.custom(ts, _moved(sp, ts, end=end))
-    # The last bar before the holdout is fine; the holdout is untouched either way.
-    assert W.custom(ts, _moved(sp, ts)).holdout == sp.holdout
-    # Between the last open bar and the holdout's first: snaps back, never forward.
-    gap = W.custom(ts, _moved(sp, ts, end=sp.holdout.start - 1))
-    assert gap.test.end == sp.test.end < sp.holdout.start
     with pytest.raises(W.WindowError, match=r"^windows\.holdout: unknown window"):
         W.custom(ts, {**_moved(sp, ts), "holdout": [0, 1]})
 
@@ -414,7 +421,7 @@ def test_sweep_resumes_with_moved_windows(btc):
     first = sweep_series(spec, s, Costs(), split=mv, record=record, done=done_for(mv))
     assert first["reused"] == 0                     # the default run's work is not reused
     assert first["windows"]["test"] == mv.test.as_dict()
-    assert first["windows"]["holdout"] == sp.holdout.as_dict()
+    assert first["windows"]["holdout"] == mv.holdout.as_dict()
 
     again = sweep_series(spec, s, Costs(), split=W.custom(s.ts, _moved(sp, s.ts)),
                          record=lambda *a: pytest.fail("re-ran recorded work"), done=done_for(mv))
@@ -445,13 +452,18 @@ def test_jobs_run_on_moved_windows_and_report_them(monkeypatch, btc):
     out = jobs.backtest_job(Conn(), {"symbol": "BTC/USD", "timeframe": "4h", "windows": moved})
     mv = W.custom(s.ts, moved)
     assert out["windows"] == mv.as_dict() and out["default_windows"] == sp.as_dict()
-    assert out["movable"] == {"start": int(s.ts[0]), "end": sp.test.end,
-                              "bars": int(np.searchsorted(s.ts, sp.test.end, side="right")),
+    end = int(s.ts[-1 - W.MIN_WINDOW_BARS])
+    assert out["movable"] == {"start": int(s.ts[0]), "end": end,
+                              "bars": int(np.searchsorted(s.ts, end, side="right")),
                               "min_bars": W.MIN_WINDOW_BARS}
     got = {r["split"]: (r["window_start"], r["window_end"]) for r in runs}
     assert got == {"train": (mv.train.start, mv.train.end), "test": (mv.test.start, mv.test.end),
-                   "full": (mv.train.start, mv.test.end)}
-    assert all(r["window_end"] < sp.holdout.start for r in runs)
+                   "full": (mv.train.start, mv.test.end),
+                   "holdout": (mv.holdout.start, mv.holdout.end),
+                   "all": (mv.train.start, mv.holdout.end)}
+    assert set(out["metrics"]) == {"train", "test", "full", "holdout"}
+    # Only the continuous run carries a curve and trades.
+    assert [r["split"] for r in runs if r["equity"] is not None] == ["all"]
 
     runs.clear()
     out = jobs.sweep_job(Conn(), {"symbol": "BTC/USD", "timeframe": "4h", "windows": moved})
@@ -466,8 +478,50 @@ def test_jobs_run_on_moved_windows_and_report_them(monkeypatch, btc):
 
     bad = {**moved, "test": [moved["test"][0], sp.holdout.end]}
     for job in (jobs.backtest_job, jobs.sweep_job):
-        with pytest.raises(jobs.JobError, match=r"^windows\.test\[1\]: reaches into the holdout"):
+        with pytest.raises(jobs.JobError, match=r"^windows\.test\[1\]: leaves the holdout fewer than"):
             job(Conn(), {"symbol": "BTC/USD", "timeframe": "4h", "windows": bad})
+
+
+def test_extend_refreshes_only_the_holdout(monkeypatch, btc):
+    """`extend` reruns the holdout and the continuous run on the newest bars and
+    writes them onto the original backtest, leaving its train/test alone; it
+    refuses windows other than the backtest's own."""
+    from btb import db
+    from btb.engine import jobs
+    s = B.Series.from_frame(btc, "4h", symbol="BTC/USD", asset_class="crypto",
+                            as_of=int(btc["ts"].iloc[-1]))
+    sp = W.split(s.ts)
+    strat = {"id": "sid", "name": "ema_cross", "spec": L.get("ema_cross"), "spec_sha": "x"}
+    monkeypatch.setattr(jobs, "_strategy", lambda *a: strat)
+    monkeypatch.setattr(jobs, "load_series", lambda *a: s)
+    runs = []
+    monkeypatch.setattr(db, "insert_run", lambda conn, **kw: (runs.append(kw), (len(runs), True))[1])
+    old = {"windows": {"train": sp.train.as_dict(), "test": sp.test.as_dict(),
+                       "holdout": {"name": "holdout", "start": 1, "end": 2}},
+           "runs": {"train": 1, "test": 2, "full": 3}, "metrics": {"test": {"net_pct": 9.0}}, "as_of": 0}
+
+    class Conn:
+        written = None
+
+        def execute(self, sql, args):
+            if sql.startswith("UPDATE"):
+                Conn.written = args[0].obj
+            return type("R", (), {"fetchone": lambda _s: (old,)})()
+
+        def commit(self):
+            pass
+
+    own = {"train": [sp.train.start, sp.train.end], "test": [sp.test.start, sp.test.end]}
+    jobs.backtest_job(Conn(), {"symbol": "BTC/USD", "timeframe": "4h", "windows": own, "extend": 7})
+    assert {r["split"] for r in runs} == {"holdout", "all"}
+    new = Conn.written
+    assert new["windows"]["holdout"] == sp.holdout.as_dict() and new["as_of"] == s.as_of
+    assert new["metrics"]["test"] == {"net_pct": 9.0} and "holdout" in new["metrics"]
+    assert new["runs"]["full"] == 3 and {"holdout", "all"} <= set(new["runs"])
+
+    moved = _moved(sp, s.ts)
+    with pytest.raises(jobs.JobError, match=r"^extend: train and test must be"):
+        jobs.backtest_job(Conn(), {"symbol": "BTC/USD", "timeframe": "4h", "windows": moved, "extend": 7})
 
 
 def test_sweep_ranks_on_test_not_train(btc):

@@ -83,13 +83,21 @@ export type SweepRow = {
   test_rank: number;
 };
 
-/* btb/verdict: one word for a sweep, and why. Always scored on the default
- * windows, whatever the handles say. */
-export type VerdictLabel = 'ROBUST' | 'WEAK' | 'OVERFIT';
+/* btb/verdict: a 0-100 score for a sweep, and why. Always scored on the
+ * default windows, whatever the handles say.
+ *
+ *   score = 100 x deflated Sharpe x (1 - PBO) x walk-forward (rule of succession)
+ *
+ * `band` is the colour, from calibration on random walks: `high` is a score at
+ * most 5% of luck-only strategies reach. */
+export type Band = 'high' | 'mid' | 'low';
 export type CheckStatus = 'pass' | 'warn' | 'fail' | 'na';
+export type Factors = { dsr: number; pbo: number; walk_forward: number };
 
 export type Verdict = {
-  label: VerdictLabel;
+  score: number;
+  band: Band;
+  factors: Factors;
   reason: string;
   checks: {
     walk_forward: { status: CheckStatus; oos_pct?: number; bh_pct?: number | null; folds?: number;
@@ -101,7 +109,7 @@ export type Verdict = {
     trades: { status: CheckStatus; count: number };
   };
   // Keyed by test rank on the default windows.
-  rows: Record<string, { label: VerdictLabel; reason: string; dsr: number | null; params: Record<string, number> }>;
+  rows: Record<string, { score: number; band: Band; reason: string; dsr: number | null; params: Record<string, number> }>;
   combos: number;
   days: number;
   pbo_logits: number[] | null;      // 20 bins over [-4, 4]
@@ -109,7 +117,7 @@ export type Verdict = {
   version: number;
 };
 
-/* One row of the Results tab: a test and its verdict. */
+/* One card of the Results tab: a test and its score. */
 export type TestSummary = {
   id: number;
   sweepId: number | null;
@@ -119,11 +127,17 @@ export type TestSummary = {
   createdAt: string;
   testPct: number | null;
   bhPct: number | null;
+  maxDd: number | null;
   combos: number | null;
-  label: VerdictLabel | null;          // null: no verdict (still scoring, failed, or from before it)
+  params: Record<string, number>;
+  labels: Record<string, string>;      // the spec's names for its settings
+  score: number | null;                // null: no score (still scoring, failed, or never scored)
+  band: Band | null;
+  reason: string | null;
   scoring: boolean;
+  thin: boolean;                       // less than two years, or too few trades to judge
   custom: boolean;                     // run on moved windows
-  spark: number[];                     // equity over train + test, ~40 points
+  spark: { equity: number[]; bh: number[] };   // the test window, both rebased to 1, ~40 points
 };
 
 export type Job = {
@@ -147,8 +161,10 @@ export type Job = {
     // on results from before windows could be moved.
     default_windows?: Split;
     movable?: { start: number; end: number; bars: number; min_bars: number };
-    metrics?: { train: Metrics; test: Metrics; full: Metrics };
-    runs?: { train: number; test: number; full: number };
+    // holdout: the chosen settings on everything after test (absent on older results).
+    metrics?: { train: Metrics; test: Metrics; full: Metrics; holdout?: Metrics };
+    // all: one continuous run, train start to the newest bar, which carries the curve and trades.
+    runs?: { train: number; test: number; full: number; holdout?: number; all?: number };
     seconds: number;
     // sweeps
     combos?: number;
@@ -162,4 +178,5 @@ export type Job = {
   };
   trades?: Trade[];
   curve?: Curve;
+  latestTs?: number;                 // the series' newest complete bar (backtests)
 };

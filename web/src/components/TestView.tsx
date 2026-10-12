@@ -10,28 +10,29 @@ import { TF_SECONDS, canMove, sameHandles, toSpans, type Handles, type WindowSpa
 
 import EquityChart, { money } from './EquityChart';
 import RankScatter from './RankScatter';
+import ScoreRing, { BAND_TONE } from './ScoreRing';
 import { loadLibrary } from './StrategiesView';
 
 /* One test's page, inside the Results tab: where a run from Strategies lands,
  * and where a row of the Results list opens.
  *
- *   top       the return on data it never saw, and the verdict on it
+ *   top       the return on data it never saw, and the score on it
  *   chart     the equity curve; its handles move train and test
- *   sweep     every setting the sweep tried, each with its own verdict
- *   judged    how the verdict was reached: walk-forward periods and the
+ *   sweep     every setting the sweep tried, each with its own score
+ *   judged    how the score was reached: walk-forward periods and the
  *             overfitting test's distribution
  *   trades
  *
  * Every number comes from the engine for the windows it ran on. Moving a
  * handle re-queues the backtest and its sweep for the new windows, and until
  * they land the old numbers are dimmed rather than passed off as current.
- * The verdict never moves with them: it is always scored on the defaults.
+ * The score never moves with them: it is always scored on the defaults.
  *
  * Re-runs made here (moved windows, a chosen row) carry `of`, the test they
  * belong to, so they stay views of this test rather than new rows in Results.
  */
 
-type Window = 'train' | 'test' | 'full';
+type Window = 'train' | 'test' | 'full' | 'holdout';
 
 const COMMIT_MS = 650;        // a pause after moving a window before it is re-run
 
@@ -51,6 +52,9 @@ export default function TestView({ id, sweepId, onBack, onNewTest }: Props) {
   // results were run on (null: follow the results), and the re-run under way.
   const [draft, setDraft] = useState<Handles | null>(null);
   const [rewind, setRewind] = useState<{ stage: 'backtest' | 'sweep'; progress: number } | null>(null);
+  // Bringing the holdout up to the newest bar, on open (see the effect below).
+  const [extending, setExtending] = useState(false);
+  const extended = useRef<number | null>(null);
   const commitTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wanted = useRef<Record<string, unknown> | null>(null);   // the next re-run's request
   const busy = useRef(false);
@@ -90,6 +94,34 @@ export default function TestView({ id, sweepId, onBack, onNewTest }: Props) {
       .catch(failed);
     if (sweepId) pollJob(sweepId, setSw, live).catch(failed);
   }, [id, sweepId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The holdout runs to the newest bar. A test run before holdouts existed has
+  // none, and any test's falls behind as new bars close; either way, on open,
+  // its holdout is rerun on the newest data and written back onto the test
+  // (an `extend` backtest). Train, test and the score are untouched. Once per
+  // open, and only while the page still shows the test itself.
+  useEffect(() => {
+    const r = bt?.result;
+    if (!bt || bt.id !== id || bt.status !== 'done' || !r?.windows || extended.current === id) return;
+    const behind = !r.runs?.all || (bt.latestTs != null && bt.latestTs > r.windows.holdout.end);
+    if (!behind) return;
+    extended.current = id;
+    const seq = winSeq.current;
+    setExtending(true);
+    const w = r.windows;
+    submitJob(body({
+      kind: 'backtest', extend: id, ...(r.params ? { params: r.params } : {}),
+      windows: { train: [w.train.start, w.train.end], test: [w.test.start, w.test.end] },
+    }))
+      .then(({ id: jid }) => pollJob(jid, () => {}, live))
+      .then((j) => (j.status === 'done' ? pollJob(id, () => {}, live) : null))
+      .then((fresh) => {
+        // Only if nothing has replaced the test on screen meanwhile.
+        if (fresh && seq === winSeq.current) setBt((cur) => (cur && cur.id === id ? fresh : cur));
+      })
+      .catch(() => {})            // a holdout that cannot be refreshed keeps the stored one
+      .finally(() => { if (seq === winSeq.current) setExtending(false); });
+  }, [bt]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Title and column labels come from the spec: the library's, or the user's
   // own stored one.
@@ -219,7 +251,7 @@ export default function TestView({ id, sweepId, onBack, onNewTest }: Props) {
       <Results
         title={meta.title} bt={bt} sw={sw} view={view} setView={setView}
         chosen={chosen} picked={!!chosenParams} rerunning={rerunning} onUse={applyRow} error={error}
-        draft={draft} setDraft={setDraft} onWindows={commitWindows} rewind={rewind}
+        draft={draft} setDraft={setDraft} onWindows={commitWindows} rewind={rewind} extending={extending}
         labels={meta.labels} onBack={onBack} onNewTest={onNewTest}
       />
     </div></div>
@@ -244,12 +276,15 @@ type ResultsProps = {
   labels: Record<string, string>;
   draft: Handles | null; setDraft: (h: Handles) => void; onWindows: (h: Handles | null) => void;
   rewind: { stage: 'backtest' | 'sweep'; progress: number } | null;
+  extending: boolean;
 };
 
 function Results({ title, bt, sw, view, setView, chosen, picked, rerunning, onUse, onBack, onNewTest, error, labels,
-                   draft, setDraft, onWindows, rewind }: ResultsProps) {
+                   draft, setDraft, onWindows, rewind, extending }: ResultsProps) {
   const r = bt.result!;
-  const m = r.metrics![view];
+  // Older results have no holdout run; their Holdout tab falls back to test.
+  const shownView: Window = r.metrics?.[view] ? view : 'test';
+  const m = r.metrics![shownView]!;
   const w = r.windows;
   // The windows these numbers are for, and where the handles are now. They
   // differ from the moment a handle moves until the re-run lands.
@@ -260,15 +295,17 @@ function Results({ title, bt, sw, view, setView, chosen, picked, rerunning, onUs
   const def = r.default_windows ? handlesOf(r.default_windows) : null;
   const isDefault = !def || sameHandles(shown, def);
   const step = TF_SECONDS[r.timeframe] ?? 3600;
-  const range = view === 'test' ? [w.test.start, w.test.end] : view === 'train' ? [w.train.start, w.train.end] : [w.train.start, w.test.end];
+  const range = shownView === 'test' ? [w.test.start, w.test.end] : shownView === 'train' ? [w.train.start, w.train.end]
+    : shownView === 'holdout' ? [w.holdout.start, w.holdout.end] : [w.train.start, w.test.end];
   const sr = sw?.status === 'done' ? sw.result : null;
   const rows = sr?.rows ?? sr?.top ?? [];
-  // The verdict is for the settings on screen when they are among the scored
-  // rows; otherwise the headline (#1 on the default windows) stands in.
-  const verdict = sr?.verdict ?? null;
+  // The score is for the settings on screen when they are among the scored
+  // rows; otherwise the headline (#1 on the default windows) stands in. A
+  // verdict stored before scores existed (and not yet rescored) counts as none.
+  const verdict = typeof sr?.verdict?.score === 'number' ? sr.verdict : null;
   const ownRow = verdict && r.params
     ? Object.values(verdict.rows).find((x) => sameParams(x.params, r.params!)) ?? null : null;
-  const shownVerdict = verdict ? ownRow ?? { label: verdict.label, reason: verdict.reason } : null;
+  const shownVerdict = verdict ? ownRow ?? { score: verdict.score, band: verdict.band, reason: verdict.reason } : null;
   const varied = rows.length ? Object.keys(rows[0].params).filter((k) => rows.some((x) => x.params[k] !== rows[0].params[k])) : [];
   // Short column heads: the spec's label without its parenthetical.
   const labelOf = (k: string) => (labels[k] ?? k.replace(/_/g, ' ')).replace(/ \(.*\)/, '').replace(/^Minimum trend strength/, 'Min. trend');
@@ -279,20 +316,21 @@ function Results({ title, bt, sw, view, setView, chosen, picked, rerunning, onUs
         <BackButton onClick={onBack} />
         <div className="sv-crumb"><b>{title || r.strategy}</b> · {r.symbol} · {r.timeframe} · data through {date(r.as_of)}
           {r.adjust !== 'none' ? ` · ${r.adjust}-adjusted` : ''}</div>
-        {verdict ? <span className={`sv-chip ${TONE[shownVerdict!.label]}`}>{shownVerdict!.label.toLowerCase()}</span>
-          : <span className="sv-chip" title={sw && sw.status !== 'done' && sw.status !== 'failed' ? 'Scored when the sweep finishes'
-            : 'This test has no verdict: it ran before the verdict engine, or its sweep failed'}>
-            {sw && sw.status !== 'done' && sw.status !== 'failed' ? 'Scoring…' : 'Unverified'}</span>}
+        {verdict ? <ScoreRing score={shownVerdict!.score} band={shownVerdict!.band} size="sm" title={shownVerdict!.reason} />
+          : <span className="sv-chip none" title={sw && sw.status !== 'done' && sw.status !== 'failed' ? 'Scored when the sweep finishes'
+            : 'This test has no score: its sweep failed, or it ran before scoring existed'}>
+            {sw && sw.status !== 'done' && sw.status !== 'failed' ? 'Scoring…' : 'Unscored'}</span>}
         <button type="button" className="sv-link" onClick={onNewTest}>New test</button>
-        <Tabs value={view} onChange={setView} />
+        <Tabs value={shownView} onChange={setView} holdout={!!r.metrics?.holdout} />
       </div>
 
       <div className={`sv-hero ${rerunning || !settled ? 'dim' : ''}`}>
         <div>
-          <div className="sv-hlabel">Return on {view === 'test' ? 'the test window' : view === 'train' ? 'the training window' : 'train + test'} · {date(range[0])} – {date(range[1])}</div>
-          <CountUp key={`${bt.id}-${view}`} className={`sv-big ${(m.net_pct ?? 0) >= 0 ? 'good' : 'bad'}`} value={m.net_pct ?? 0} />
+          <div className="sv-hlabel">Return on {shownView === 'test' ? 'the test window' : shownView === 'train' ? 'the training window'
+            : shownView === 'holdout' ? 'the holdout, after the test window' : 'train + test'} · {date(range[0])} – {date(range[1])}</div>
+          <CountUp key={`${bt.id}-${shownView}`} className={`sv-big ${(m.net_pct ?? 0) >= 0 ? 'good' : 'bad'}`} value={m.net_pct ?? 0} />
           <div className="sv-vs">vs <span className="mono">{pct(m.bh_pct)}</span> buy &amp; hold · {chosen ? `settings #${chosen}` : picked ? 'your picked settings' : 'chosen settings'}</div>
-          <p className="sv-say">{sentence(m, view)}</p>
+          <p className="sv-say">{sentence(m, shownView)}</p>
         </div>
         <div className="sv-stats">
           <Stat label="Max drawdown" value={m.max_dd_pct == null ? '—' : `−${m.max_dd_pct.toFixed(1)}%`} tone="bad" />
@@ -302,7 +340,7 @@ function Results({ title, bt, sw, view, setView, chosen, picked, rerunning, onUs
           <Stat label="Profit factor" value={m.profit_factor == null ? '—' : m.profit_factor.toFixed(2)} />
         </div>
       </div>
-      {verdict && <VerdictRow v={verdict} row={shownVerdict!} own={ownRow} moved={!isDefault || (!!def && !sameHandles(ran, def))} />}
+      {verdict && <ScoreRow v={verdict} row={shownVerdict!} own={ownRow} moved={!isDefault || (!!def && !sameHandles(ran, def))} />}
       {m.ruin && <div className="sv-warnline bad">This run lost the whole account. Everything after that point is flat at zero.</div>}
       {w.thin_sample && <div className="sv-warnline">
         {def && !sameHandles(ran, def) ? 'Train and test cover less than two years.' : 'Less than two years of data.'} Treat any result here as thin evidence.</div>}
@@ -312,7 +350,7 @@ function Results({ title, bt, sw, view, setView, chosen, picked, rerunning, onUs
         <EquityChart
           curve={bt.curve} trainEnd={w.test.start} animateKey={String(bt.id)}
           windows={movable ? {
-            value: shown, movable, holdout: [w.holdout.start, w.holdout.end], step, settled,
+            value: shown, movable, holdout: [shown[2] + step, w.holdout.end], step, settled,
             onChange: setDraft, onCommit: onWindows,
           } : undefined}
         />
@@ -321,11 +359,11 @@ function Results({ title, bt, sw, view, setView, chosen, picked, rerunning, onUs
         <div className="sv-wins">
           <span>Train <span className="mono">{date(shown[0])} – {date(settled ? w.train.end : shown[1] - step)}</span></span>
           <span>Test <span className="mono">{date(shown[1])} – {date(shown[2])}</span></span>
-          <span>Holdout <span className="mono">{date(w.holdout.start)} – {date(w.holdout.end)}</span> · never used</span>
+          <span>Holdout <span className="mono">{date(settled ? w.holdout.start : shown[2] + step)} – {date(w.holdout.end)}</span> · after test; never used to pick or score</span>
           <span className="sv-wins-state">
             {rewind?.stage === 'backtest' ? 'Re-running on these windows…'
               : rewind ? `Re-ranking every setting on the new test window… ${Math.round(rewind.progress * 100)}%`
-                : !settled ? 'Release to re-run' : ''}
+                : !settled ? 'Release to re-run' : extending ? 'Bringing the holdout up to the latest bar…' : ''}
           </span>
           {!isDefault && <button type="button" className="sv-link" onClick={() => onWindows(null)}>Reset to default windows</button>}
         </div>
@@ -345,7 +383,7 @@ function Results({ title, bt, sw, view, setView, chosen, picked, rerunning, onUs
       </section>
       {verdict && <Judged v={verdict} varied={varied} labelOf={labelOf} />}
 
-      {bt.trades && <TradeList trades={bt.trades} testStart={w.test.start} stale={!settled} />}
+      {bt.trades && <TradeList trades={bt.trades} testStart={w.test.start} holdoutStart={w.holdout.start} stale={!settled} />}
 
       <div className="sv-costnote">
         Every number above already pays <b>{m.costs?.commission_pct ?? 0}% commission + {m.costs?.slippage_bps ?? 0} bps slippage</b> on
@@ -356,7 +394,7 @@ function Results({ title, bt, sw, view, setView, chosen, picked, rerunning, onUs
   );
 }
 
-function Tabs({ value, onChange }: { value: Window; onChange: (w: Window) => void }) {
+function Tabs({ value, onChange, holdout }: { value: Window; onChange: (w: Window) => void; holdout: boolean }) {
   const ref = useRef<HTMLDivElement>(null);
   const [ul, setUl] = useState({ left: 0, width: 0 });
   useLayoutEffect(() => {
@@ -365,7 +403,7 @@ function Tabs({ value, onChange }: { value: Window; onChange: (w: Window) => voi
   }, [value]);
   return (
     <div className="sv-wtabs" ref={ref}>
-      {(['train', 'test', 'full'] as Window[]).map((v) => (
+      {(['train', 'test', 'full', ...(holdout ? ['holdout'] : [])] as Window[]).map((v) => (
         <button key={v} type="button" className={v === value ? 'on' : ''} onClick={() => onChange(v)}>
           {v === 'full' ? 'Train + test' : v[0].toUpperCase() + v.slice(1)}
         </button>
@@ -377,62 +415,53 @@ function Tabs({ value, onChange }: { value: Window; onChange: (w: Window) => voi
 
 /* -- verdict -------------------------------------------------------------------- */
 
-const TONE: Record<Verdict['label'], string> = { ROBUST: 'good', WEAK: 'warn', OVERFIT: 'bad' };
 const STATUS_TONE: Record<string, string> = { pass: 'good', warn: 'warn', fail: 'bad', na: '' };
 
-// What each check means, in a sentence or two, behind its info button.
+// What each factor means, in a sentence or two, behind its info button.
 const EXPLAIN = {
-  wf: 'Replays the choice as if it were happening live: pick the best settings using only the past, '
-    + 'trade them on the next stretch, and repeat five times. The number is what that would have made.',
-  pbo: 'History is split in half thousands of different ways. Each time, we check whether the setting that won '
-    + 'on one half landed in the bottom half of the other. Above 50% means the winner is mostly luck.',
   dsr: 'The Sharpe ratio (return per unit of risk), marked down for how many settings were tried: trying many '
-    + 'makes a lucky high score likely. Reads as the chance the edge is real. 0.95 or more is convincing.',
+    + 'makes a lucky high score likely. This is the chance the edge is real after that markdown.',
+  pbo: 'History is split in half thousands of different ways. Each time, we check whether the setting that won '
+    + 'on one half stayed in the top half of the other. This is how often it did.',
+  wf: 'Replays the choice as if it were happening live: pick the best settings using only the past, '
+    + 'trade them on the next stretch, and repeat five times. This is the chance the next stretch makes money, '
+    + 'judged from how many of the five did.',
 };
 
-function VerdictRow({ v, row, own, moved }: {
-  v: Verdict; row: { label: Verdict['label']; reason: string }; own: { dsr: number | null } | null; moved: boolean;
+const asPct = (x: number) => `${Math.round(x * 100)}%`;
+
+/* The score and the three numbers it is the product of. A row's own deflated
+ * Sharpe replaces the headline's; the other two judge the whole grid. */
+function ScoreRow({ v, row, own, moved }: {
+  v: Verdict; row: { score: number; band: Verdict['band']; reason: string }; own: { dsr: number | null } | null; moved: boolean;
 }) {
-  const { walk_forward: wf, pbo, dsr } = v.checks;
-  const d = own ? own.dsr : dsr.value;
-  const dTone = d == null ? '' : d < 0.5 ? 'bad' : d < 0.95 ? 'warn' : 'good';
+  const f = { ...v.factors, ...(own ? { dsr: own.dsr ?? 0 } : {}) };
+  const { walk_forward: wf, dsr } = v.checks;
   return (
-    <div className="sv-verdict">
-      <div className="sv-vtext">
-        <div className="sv-hlabel">Verdict{own ? '' : ' · for the best setting; this one was not among those scored'}</div>
-        <div className={`sv-vword ${TONE[row.label]}`}>{row.label[0] + row.label.slice(1).toLowerCase()}</div>
+    <div className="sv-score">
+      <ScoreRing score={row.score} band={row.band} size="lg" />
+      <div className="sv-stext">
         <p>{row.reason}</p>
-        {moved && <p className="sv-vnote">Scored on the default windows, not the ones you moved. Moving windows can't change a verdict.</p>}
-      </div>
-      <div className="sv-checks">
-        <Check label="Walk-forward" tip={EXPLAIN.wf} tone={STATUS_TONE[wf.status]}
-               value={wf.oos_pct == null ? '—' : pct(wf.oos_pct)}
-               sub={wf.folds ? `${wf.folds_positive} of ${wf.folds} periods up${wf.bh_pct != null ? ` · hold ${pct(wf.bh_pct)}` : ''}` : 'Not enough data'} />
-        <Check label="Chance it's overfit" tip={EXPLAIN.pbo} tone={STATUS_TONE[pbo.status]}
-               value={pbo.value == null ? '—' : `${Math.round(pbo.value * 100)}%`}
-               meter={pbo.value == null ? undefined : { value: pbo.value, marks: [0.2, 0.5] }}
-               sub={pbo.value == null ? 'Not enough data' : undefined} />
-        <Check label="Deflated Sharpe" tip={EXPLAIN.dsr} tone={dTone}
-               value={d == null ? '—' : d.toFixed(2)}
-               meter={d == null ? undefined : { value: d, marks: [0.5, 0.95] }}
-               sub={`after ${dsr.trials} setting${dsr.trials === 1 ? '' : 's'} tried`} />
+        <Factor label={`Survives ${dsr.trials} setting${dsr.trials === 1 ? '' : 's'} tried`} tip={EXPLAIN.dsr} value={f.dsr} />
+        <Factor label="Holds up on unseen data" tip={EXPLAIN.pbo} value={f.pbo} />
+        <Factor label={wf.folds ? `Real-time picks made money, ${wf.folds_positive} of ${wf.folds}` : 'Real-time picks: not enough data'}
+                tip={EXPLAIN.wf} value={f.walk_forward} />
+        <div className="sv-snote mono">{row.score} = {asPct(f.dsr)} × {asPct(f.pbo)} × {asPct(f.walk_forward)}</div>
+        {!own && <p className="sv-vnote">For the best setting; the one on screen was not among those scored.</p>}
+        {moved && <p className="sv-vnote">Scored on the default windows, not the ones you moved. Moving windows can't change a score.</p>}
       </div>
     </div>
   );
 }
 
-function Check({ label, tip, value, tone, sub, meter }: {
-  label: string; tip: string; value: string; tone: string; sub?: string; meter?: { value: number; marks: number[] };
-}) {
+function Factor({ label, tip, value }: { label: string; tip: string; value: number }) {
   return (
-    <div className="sv-stat sv-check">
-      <small>{label}
-        <button type="button" className="sv-info" aria-label={`What is ${label.toLowerCase()}?`}>i
-          <span className="sv-tip" role="tooltip">{tip}</span></button></small>
-      <b className={tone}>{value}</b>
-      {meter && <span className="sv-meter"><span className={tone} style={{ width: `${Math.max(0, Math.min(1, meter.value)) * 100}%` }} />
-        {meter.marks.map((x) => <i key={x} style={{ left: `${x * 100}%` }} />)}</span>}
-      {sub && <em>{sub}</em>}
+    <div className="sv-factor">
+      <span>{label}
+        <button type="button" className="sv-info" aria-label={`What does "${label.toLowerCase()}" mean?`}>i
+          <span className="sv-tip" role="tooltip">{tip}</span></button></span>
+      <span className="sv-track"><i style={{ width: asPct(Math.max(0, Math.min(1, value))) }} /></span>
+      <b className="mono">{asPct(value)}</b>
     </div>
   );
 }
@@ -457,13 +486,13 @@ function CountUp({ value, className }: { value: number; className: string }) {
   return <div className={className}>{pct(v)}</div>;
 }
 
-function TradeList({ trades, testStart, stale }: { trades: Trade[]; testStart: number; stale: boolean }) {
+function TradeList({ trades, testStart, holdoutStart, stale }: { trades: Trade[]; testStart: number; holdoutStart: number; stale: boolean }) {
   const [all, setAll] = useState(false);
   const recent = [...trades].reverse();
   const shown = all ? recent : recent.slice(0, 14);
   return (
     <section className={`sv-section ${stale ? 'sv-stale' : ''}`}>
-      <div className="sv-sech"><h3>Trades</h3><p>{trades.length} over train + test · newest first</p></div>
+      <div className="sv-sech"><h3>Trades</h3><p>{trades.length} over train, test{trades.some((t) => t.entry_ts >= holdoutStart) ? ' and the holdout' : ''} · newest first</p></div>
       <div className="sv-tblwrap">
         <table className="sv-t">
           <thead><tr><th>Entry</th><th>Exit</th><th>Side</th><th>Entry</th><th>Exit</th><th>Why it closed</th><th>P&amp;L</th><th>Window</th></tr></thead>
@@ -477,7 +506,7 @@ function TradeList({ trades, testStart, stale }: { trades: Trade[]; testStart: n
                 <td className="mono">{price(t.exit_px)}</td>
                 <td className="dim">{t.reason === 'end' ? 'still open at the end' : t.reason === 'signal' ? 'exit signal' : t.reason.replace('_', ' ')}</td>
                 <td className={`mono ${t.pnl_pct >= 0 ? 'good' : 'bad'}`}>{pct(t.pnl_pct)}</td>
-                <td className="dim">{t.entry_ts >= testStart ? 'test' : 'train'}</td>
+                <td className="dim">{t.entry_ts >= holdoutStart ? 'holdout' : t.entry_ts >= testStart ? 'test' : 'train'}</td>
               </tr>
             ))}
           </tbody>
@@ -514,7 +543,8 @@ function sameParams(a: Record<string, number>, b: Record<string, number>): boole
 /* -- words and numbers ---------------------------------------------------------- */
 
 function sentence(m: Metrics, view: Window): string {
-  const where = view === 'train' ? 'the training window' : view === 'test' ? 'data it never saw' : 'train and test together';
+  const where = view === 'train' ? 'the training window' : view === 'test' ? 'data it was not trained on'
+    : view === 'holdout' ? 'the holdout, after everything it was picked on' : 'train and test together';
   if (m.ruin) return `Lost the entire account on ${where}. Nothing else here matters.`;
   const net = m.net_pct ?? 0, bh = m.bh_pct ?? 0;
   if (net < 0) return `Lost ${pct(net, false)} on ${where}, while simply holding made ${pct(bh)}.`;
@@ -524,36 +554,31 @@ function sentence(m: Metrics, view: Window): string {
 
 /* -- the sweep ------------------------------------------------------------------ */
 
-type Sort = 'test' | 'train' | 'dsr' | 'trades';
+type Sort = 'test' | 'train' | 'score' | 'trades';
 const PAGE = 12;
 
 /* Every combination the sweep tried, not just the best: ranked on the test
- * window, each with its own verdict. Sortable, filterable by verdict. */
+ * window, each with its own score. Sortable, filterable by score. */
 function SweepTable({ rows, combos, verdict, varied, labelOf, chosen, busy, running, onUse }: {
   rows: SweepRow[]; combos: number; verdict: Verdict | null; varied: string[]; labelOf: (k: string) => string;
   chosen: number | null; busy: boolean; running: boolean; onUse: (r: SweepRow) => void;
 }) {
   const [sort, setSort] = useState<Sort>('test');
-  const [only, setOnly] = useState<Verdict['label'] | 'all'>('all');
+  const [min, setMin] = useState(0);
   const [all, setAll] = useState(false);
   const judged = useMemo(() => {
     const byKey = new Map(Object.values(verdict?.rows ?? {}).map((v) => [key(v.params), v]));
     return rows.map((r) => ({ r, v: byKey.get(key(r.params)) ?? null }));
   }, [rows, verdict]);
-  const counts = useMemo(() => {
-    const c: Record<string, number> = { ROBUST: 0, WEAK: 0, OVERFIT: 0 };
-    for (const { v } of judged) if (v) c[v.label]++;
-    return c;
-  }, [judged]);
   const shown = useMemo(() => {
     const by: Record<Sort, (x: typeof judged[number]) => number> = {
       test: (x) => x.r.test_rank,
       train: (x) => x.r.train_rank,
-      dsr: (x) => -(x.v?.dsr ?? -1),
+      score: (x) => -(x.v?.score ?? -1),
       trades: (x) => -x.r.test.trades,
     };
-    return judged.filter((x) => only === 'all' || x.v?.label === only).sort((a, b) => by[sort](a) - by[sort](b));
-  }, [judged, only, sort]);
+    return judged.filter((x) => !min || (x.v?.score ?? 0) >= min).sort((a, b) => by[sort](a) - by[sort](b));
+  }, [judged, min, sort]);
   const page = all ? shown : shown.slice(0, PAGE);
   const th = (s: Sort, label: string) => (
     <th><button type="button" className={`sv-sort ${sort === s ? 'on' : ''}`} onClick={() => setSort(s)}>{label}</button></th>
@@ -562,13 +587,15 @@ function SweepTable({ rows, combos, verdict, varied, labelOf, chosen, busy, runn
   return (
     <div className="sv-sweep">
       {verdict && (
-        <div className="seg sv-vfilter">
-          {(['all', 'ROBUST', 'WEAK', 'OVERFIT'] as const).map((f) => (
-            <button key={f} type="button" className={only === f ? 'on' : ''} onClick={() => { setOnly(f); setAll(false); }}>
-              {f === 'all' ? 'All' : f[0] + f.slice(1).toLowerCase()}
-              <span className="sv-n">{f === 'all' ? rows.length : counts[f]}</span>
-            </button>
-          ))}
+        <div className="sv-sweeptools">
+          <div className="seg">
+            {([['test', 'Test rank'], ['score', 'Score'], ['train', 'Train rank']] as const).map(([k, label]) => (
+              <button key={k} type="button" className={sort === k ? 'on' : ''} onClick={() => setSort(k)}>{label}</button>
+            ))}
+          </div>
+          <label className="sv-min">Score at least
+            <input type="range" min={0} max={100} value={min} onChange={(e) => { setMin(+e.target.value); setAll(false); }} />
+            <span className="mono">{min}</span></label>
         </div>
       )}
       <div className="sv-tblwrap">
@@ -576,7 +603,7 @@ function SweepTable({ rows, combos, verdict, varied, labelOf, chosen, busy, runn
           <thead><tr>
             {th('test', '#')}{varied.map((k) => <th key={k}>{labelOf(k)}</th>)}
             <th>Test return</th>{th('train', 'Train rank')}{th('trades', 'Trades')}
-            {verdict && th('dsr', 'Deflated Sharpe')}{verdict && <th>Verdict</th>}<th />
+            {verdict && <th>Deflated Sharpe</th>}{verdict && th('score', 'Score')}<th />
           </tr></thead>
           <tbody>
             {page.map(({ r, v }) => (
@@ -587,7 +614,8 @@ function SweepTable({ rows, combos, verdict, varied, labelOf, chosen, busy, runn
                 <td className={`mono ${r.train_rank > r.test_rank + 8 ? 'warn' : ''}`}>{r.train_rank} <span className="dim">of {combos}</span></td>
                 <td className="mono">{r.test.trades}</td>
                 {verdict && <td className="mono">{v?.dsr == null ? '—' : v.dsr.toFixed(2)}</td>}
-                {verdict && <td>{v ? <span className={`sv-chip sm ${TONE[v.label]}`} title={v.reason}>{v.label.toLowerCase()}</span> : <span className="dim">—</span>}</td>}
+                {verdict && <td>{v ? <span className="sv-sbar" title={v.reason}><span><i className={BAND_TONE[v.band]} style={{ width: `${Math.max(v.score, 3)}%` }} /></span>
+                  <b className="mono">{v.score}</b></span> : <span className="dim">—</span>}</td>}
                 <td><button type="button" className="sv-use" disabled={busy} onClick={() => onUse(r)}>
                   {chosen === r.test_rank ? (running ? 'Running…' : 'Using') : 'Use'}</button></td>
               </tr>
@@ -595,7 +623,7 @@ function SweepTable({ rows, combos, verdict, varied, labelOf, chosen, busy, runn
           </tbody>
         </table>
       </div>
-      {!shown.length && <div className="sv-note" style={{ marginTop: 12 }}>No settings with that verdict.</div>}
+      {!shown.length && <div className="sv-note" style={{ marginTop: 12 }}>No settings score that high.</div>}
       {shown.length > PAGE && <button type="button" className="sv-link" style={{ marginTop: 12 }} onClick={() => setAll(!all)}>
         {all ? 'Show fewer' : `Show all ${shown.length}`}</button>}
     </div>
@@ -606,7 +634,7 @@ function key(p: Record<string, number>): string {
   return JSON.stringify(Object.keys(p).sort().map((k) => [k, p[k]]));
 }
 
-/* How the verdict was reached: the walk-forward periods, and the spread of
+/* How the score was reached: the walk-forward periods, and the spread of
  * where the training winner landed out of sample across every split. */
 function Judged({ v, varied, labelOf }: { v: Verdict; varied: string[]; labelOf: (k: string) => string }) {
   const wf = v.checks.walk_forward;
@@ -617,8 +645,8 @@ function Judged({ v, varied, labelOf }: { v: Verdict; varied: string[]; labelOf:
   const dsr = v.checks.dsr;
   return (
     <section className="sv-section">
-      <div className="sv-sech"><h3>How the verdict was reached</h3>
-        <p>All scored on the default windows ({date(v.windows.train.start)} – {date(v.windows.test.end)}), never the holdout.</p></div>
+      <div className="sv-sech"><h3>How the score was reached</h3>
+        <p>All scored on the default windows ({date(v.windows.train.start)} – {date(v.windows.test.end)}), never anything after them.</p></div>
       <div className="sv-judge">
         <div className="sv-jcard">
           <h4>Walk-forward <span className={`mono ${STATUS_TONE[wf.status]}`}>{wf.oos_pct == null ? '—' : pct(wf.oos_pct)}</span></h4>

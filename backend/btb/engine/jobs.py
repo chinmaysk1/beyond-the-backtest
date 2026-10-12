@@ -23,9 +23,12 @@ import json
 import time
 from typing import Callable
 
+from psycopg.types.json import Jsonb
+
 from .. import db
 from .. import verdict as V
 from ..data import adjust as ADJ
+
 from . import backtest as B
 from . import spec as S
 from . import windows as W
@@ -160,19 +163,40 @@ def backtest_job(conn, payload: dict, *, job_id: int | None = None,
     cfg = B.config(costs, fill=fill, adjust=series.adjust)
     split = _split(payload, series)
 
+    # Train, test, both, and the holdout: each a fresh run with its own metrics.
+    # Then one continuous run from train start to the newest bar, whose curve
+    # and trades the page shows -- a position open at the end of test carries
+    # on into the holdout, as it would have.
+    #
+    # `extend` names a finished backtest to bring up to date instead: same
+    # settings and train/test windows (passed in `windows`), but only the
+    # holdout and the continuous run are redone, on the newest bars, and the
+    # results are written back onto that backtest. Its train/test numbers and
+    # its score stay exactly as they were.
+    extend = payload.get("extend")
+    if extend is not None and (isinstance(extend, bool) or not isinstance(extend, int) or extend < 1):
+        raise JobError("extend must be a job id")
     runs, metrics = {}, {}
-    for w in (split.train, split.test, split.full()):
-        full = w.name == "full"
+    wins = [split.train, split.test, split.full(), split.through()]
+    if split.holdout.end > split.holdout.start:
+        wins.insert(3, split.holdout)
+    if extend is not None:
+        wins = [w for w in wins if w.name in ("holdout", "all")]
+    for w in wins:
+        drawn = w.name == "all"
         r = B.run(spec, params, series, window=(w.start, w.end), costs=costs,
-                  fill=fill, with_curve=full)
+                  fill=fill, with_curve=drawn)
         rid, _ = db.insert_run(
             conn, job_id=job_id, strategy_id=strat["id"], symbol=series.symbol,
             timeframe=series.timeframe, params=r.params, window_start=r.window[0],
             window_end=r.window[1], as_of=series.as_of, split=w.name,
             metrics=r.metrics, config=cfg,
-            trades=r.trades if full else None, equity=r.curve if full else None)
+            trades=r.trades if drawn else None, equity=r.curve if drawn else None)
         runs[w.name] = rid
-        metrics[w.name] = r.metrics
+        if w.name != "all":
+            metrics[w.name] = r.metrics
+    if extend is not None:
+        _extend(conn, extend, user_id, split, series, runs, metrics)
     conn.commit()
     return {
         "strategy": strat["name"], "spec_sha": strat["spec_sha"],
@@ -182,6 +206,27 @@ def backtest_job(conn, payload: dict, *, job_id: int | None = None,
         "runs": runs, "metrics": metrics,
         "seconds": round(time.perf_counter() - t0, 2),
     }
+
+
+def _extend(conn, job_id: int, user_id: str | None, split: W.Split, series: B.Series,
+            runs: dict, metrics: dict) -> None:
+    """Write a fresh holdout onto a finished backtest of the same user, keeping
+    everything else it holds. Refused unless its train/test windows are the
+    ones just run, so the holdout always starts on the bar after its test."""
+    row = conn.execute("SELECT result FROM jobs WHERE id = %s AND kind = 'backtest' "
+                       "AND status = 'done' AND user_id IS NOT DISTINCT FROM %s",
+                       (job_id, user_id)).fetchone()
+    if not row or not row[0]:
+        raise JobError(f"extend: no finished backtest {job_id}")
+    old = row[0]
+    w = old.get("windows") or {}
+    if (w.get("train"), w.get("test")) != (split.train.as_dict(), split.test.as_dict()):
+        raise JobError("extend: train and test must be the backtest's own windows")
+    new = {**old, "as_of": series.as_of,
+           "windows": {**w, "holdout": split.holdout.as_dict()},
+           "runs": {**old.get("runs", {}), **runs},
+           "metrics": {**old.get("metrics", {}), **metrics}}
+    conn.execute("UPDATE jobs SET result = %s WHERE id = %s", (Jsonb(new), job_id))
 
 
 # -- sweep ----------------------------------------------------------------------------
@@ -299,7 +344,7 @@ def sweep_job(conn, payload: dict, *, job_id: int | None = None,
     conn.commit()
 
     # The verdict is always scored on the DEFAULT windows: one that moved with
-    # dragged windows could be dragged until it said ROBUST. Moved windows need
+    # dragged windows could be dragged until it looked good. Moved windows need
     # the default ranking too; its runs are usually recorded already.
     base = W.split(series.ts)
     ranked = out if split == base else sweep_series(

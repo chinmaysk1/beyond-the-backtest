@@ -1,0 +1,202 @@
+/* Glass: the material every surface in the app is made of.
+ *
+ * Clear glass on a static space backdrop, faintly tinted pink -> yellow
+ * (#f2d2f0 -> #ffe879). Three parts: an almost invisible fill, a hairline rim
+ * a little brighter at the top-left, and a very faint reflection across the
+ * top. Imported last, from layout.tsx, so it is the layer that decides how a
+ * surface looks; layout and behaviour stay in globals.css and experience.css.
+ *
+ * The blur budget (web/PLAN.md, "Glass"). Blur re-rasterises whatever is
+ * beneath a layer on every paint, and with a render loop it is what made the
+ * first prototype drop frames. So:
+ *
+ *   - The backdrop is painted once and is already soft. Blurring it would
+ *     change almost nothing, so cards and panels over it are glass WITHOUT
+ *     blur: fill, rim and reflection only.
+ *   - Real blur (.glass-blur) only where glass sits over moving, sharp
+ *     content: the nav pill, the market list over the candles, menus and
+ *     tooltips. Never inside a scrolling area, where it is redrawn on every
+ *     frame of the scroll.
+ *   - Effects move only transform and opacity. No animated gradients, and no
+ *     render loop on any working screen (the landing's scene is the one).
+ *   - No refraction: on the web it needs SVG displacement on the backdrop,
+ *     which only Chromium supports and which costs far more per frame.
+ */
+
+:root {
+  --bg: #050609;
+  --text: #e9ecef;
+  --text-2: #9aa2ab;
+  --text-3: #626a73;
+  --good: #7fb89d;
+  --good-bg: rgba(127, 184, 157, 0.12);
+  --bad: #c98a84;
+  --bad-bg: rgba(201, 138, 132, 0.12);
+  --warn: #c2a87a;
+  --warn-bg: rgba(194, 168, 122, 0.12);
+  --hold: #6f9bd6;                         /* buy-and-hold, on every chart */
+
+  /* The material. Tint #f2d2f0 -> #ffe879; strength, rim and glow as chosen. */
+  --glass-fill-a: rgba(242, 210, 240, 0.056);
+  --glass-fill-b: rgba(255, 232, 121, 0.031);
+  --glass-top: rgba(242, 210, 240, 0.037);
+  --glass-rim-a: rgba(242, 210, 240, 0.11);
+  --glass-rim-m: rgba(255, 232, 121, 0.033);
+  --glass-rim-b: rgba(255, 232, 121, 0.038);
+  --glass-glow: rgba(242, 210, 240, 0.028);
+  --glass-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+  --glass-hi: rgba(255, 255, 255, 0.07);   /* a selected control on glass */
+  --glass-well: rgba(255, 255, 255, 0.035);/* an input or track sunk into glass */
+
+  --panel-glass: transparent;
+  --border: rgba(255, 255, 255, 0.07);
+  --border-soft: rgba(255, 255, 255, 0.045);
+
+  /* Near-black space, a few dim stars, two faint patches of colour. */
+  --backdrop:
+    radial-gradient(1px 1px at 12% 22%, rgba(255, 255, 255, 0.35), transparent 2px),
+    radial-gradient(1px 1px at 72% 12%, rgba(255, 255, 255, 0.28), transparent 2px),
+    radial-gradient(1px 1px at 38% 64%, rgba(255, 255, 255, 0.22), transparent 2px),
+    radial-gradient(1px 1px at 86% 58%, rgba(255, 255, 255, 0.3), transparent 2px),
+    radial-gradient(1px 1px at 22% 84%, rgba(255, 255, 255, 0.22), transparent 2px),
+    radial-gradient(1px 1px at 58% 34%, rgba(255, 255, 255, 0.18), transparent 2px),
+    radial-gradient(1px 1px at 92% 88%, rgba(255, 255, 255, 0.2), transparent 2px),
+    radial-gradient(50% 60% at 82% 16%, rgba(78, 74, 140, 0.14), transparent 70%),
+    radial-gradient(45% 55% at 12% 88%, rgba(50, 96, 110, 0.1), transparent 70%),
+    #050609;
+}
+
+body { background: var(--bg); }
+.app::before { background: var(--backdrop); }
+.stage { background: transparent; }
+.login { background: var(--backdrop); }
+
+/* ------------------------------------------------------------- the material */
+
+.glass, .panel, .login-card, .sv-body, .icon-btn, .tabs, .sv-pop, .sv-tip,
+.sv-hero .sv-stat, .sv-sweep, .glass-btn, .sv-back {
+  isolation: isolate;
+  background: linear-gradient(170deg, var(--glass-fill-a), var(--glass-fill-b));
+  border: 0;
+  box-shadow: inset 0 1px 0 var(--glass-top), var(--glass-shadow);
+}
+.glass, .panel, .login-card, .sv-body, .tabs, .sv-hero .sv-stat, .sv-sweep, .glass-btn, .sv-back { position: relative; }
+
+/* the rim */
+.glass::before, .panel::before, .login-card::before, .sv-body::before, .icon-btn::before, .tabs::before,
+.sv-pop::before, .sv-tip::before, .sv-hero .sv-stat::before, .sv-sweep::before, .glass-btn::before, .sv-back::before {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; padding: 1px; pointer-events: none;
+  background: linear-gradient(160deg, var(--glass-rim-a), var(--glass-rim-m) 40%, var(--glass-rim-b));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+}
+/* the reflection */
+.glass::after, .panel::after, .login-card::after, .sv-body::after, .tabs::after,
+.sv-hero .sv-stat::after, .sv-sweep::after, .glass-btn::after {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; z-index: -1;
+  background: radial-gradient(120% 50% at 20% -15%, var(--glass-glow), transparent 60%);
+  transition: transform 0.5s var(--ease);
+}
+
+/* Real blur: only over moving, sharp content (see the budget above). */
+.glass-blur, .tabs, .panel, .sv-pop, .sv-tip {
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  backdrop-filter: blur(20px) saturate(140%);
+}
+/* The market list sits over the candles: a darker base and no saturation boost,
+   so red and green candles passing beneath read as shadow, not a coloured smear. */
+.panel {
+  background: linear-gradient(170deg, var(--glass-fill-a), var(--glass-fill-b)), rgba(8, 10, 13, 0.6);
+  -webkit-backdrop-filter: blur(24px); backdrop-filter: blur(24px);
+}
+/* Menus and tooltips sit over text, so they carry a darker base under the tint. */
+.sv-pop, .sv-tip { background: linear-gradient(170deg, var(--glass-fill-a), var(--glass-fill-b)), rgba(12, 14, 18, 0.78); }
+
+/* ---------------------------------------------------------------- controls */
+
+.glass-btn {
+  padding: 8px 16px; border-radius: 999px; font-size: 12.5px; color: var(--text-2);
+  transition: color 0.2s var(--ease), transform 0.25s var(--ease);
+}
+.glass-btn:hover { color: var(--text); transform: translateY(-1px); }
+
+/* The nav: one floating pill, the active tab a raised patch inside it. */
+.tabs { gap: 0; padding: 0; border-radius: 999px; }
+.tabs button { position: relative; z-index: 1; background: transparent; border: 0; border-radius: 999px; padding: 10px 17px;
+  color: var(--text-3); box-shadow: none; transition: color 0.35s var(--ease); }
+.tabs button:hover:not(:disabled):not(.on) { background: transparent; color: var(--text-2); }
+.tabs button.on { background: transparent; border: 0; color: var(--text); box-shadow: none; }
+/* The highlight: one pill, the full height of the bar, sliding to the active tab. */
+.tabs-pill { position: absolute; top: 0; bottom: 0; z-index: 0; border-radius: 999px; pointer-events: none;
+  background: var(--glass-hi); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06); }
+.tabs-pill.slide { transition: left 0.45s var(--ease-out), width 0.45s var(--ease-out); }
+.icon-btn { background: linear-gradient(170deg, var(--glass-fill-a), var(--glass-fill-b)); }
+.icon-btn:hover { background: var(--glass-hi); }
+
+.seg, .sv-seg { background: var(--glass-well); border: 0; }
+.seg button.on { background: var(--glass-hi); }
+.sv-seg-pill { background: var(--glass-hi); box-shadow: none; }
+
+.chip { background: var(--glass-well); border: 0; }
+.chip.on { background: rgba(255, 255, 255, 0.1); border: 0; }
+
+.field input, .sv-pick, .sv-lib-search, .sv-num input, .sv-pop input {
+  background: var(--glass-well); border: 1px solid transparent;
+}
+.field input:focus, .sv-lib-search:focus, .sv-pick:hover, .sv-picker.open .sv-pick { border-color: rgba(255, 255, 255, 0.12); }
+.sv-json { background: rgba(0, 0, 0, 0.35); border-color: rgba(255, 255, 255, 0.06); }
+.sv-prompt { background: var(--glass-well); border: 0; }
+.sv-prompt pre::after { background: linear-gradient(transparent, rgba(10, 12, 15, 0.9)); }
+.sv-tick, .mrow .tick, .sv-pop-item:hover, .sv-pop-item.on { background: var(--glass-well); }
+
+/* The primary actions: a brighter patch of the same glass, not a white slab. */
+.btn-primary, .sv-run {
+  background: rgba(255, 255, 255, 0.1); color: var(--text);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+.btn-primary:hover { opacity: 1; background: rgba(255, 255, 255, 0.14); }
+.sv-run:hover:not(:disabled) { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1), inset 0 0 0 1px rgba(255, 255, 255, 0.12), 0 14px 40px rgba(0, 0, 0, 0.35); }
+.sv-run::after { background: linear-gradient(100deg, transparent, rgba(255, 255, 255, 0.12), transparent); }
+
+.sv-back { border-radius: 999px; padding: 7px 12px 7px 9px; }
+.sv-back:hover { background: var(--glass-hi); }
+.sv-use { border-color: rgba(255, 255, 255, 0.06); }
+.sv-use:hover:not(:disabled) { background: var(--glass-hi); border-color: rgba(255, 255, 255, 0.1); }
+
+/* --------------------------------------------------------------- surfaces */
+
+/* Landing cards: glass over the moving scene, so no blur. Their own ::before
+   is the hover spotlight, so the rim is a border here. */
+.room {
+  background: linear-gradient(170deg, var(--glass-fill-a), var(--glass-fill-b));
+  border: 1px solid var(--glass-rim-a);
+  box-shadow: inset 0 1px 0 var(--glass-top), 0 20px 50px rgba(0, 0, 0, 0.35);
+}
+.room:hover { border-color: rgba(242, 210, 240, 0.2); box-shadow: inset 0 1px 0 var(--glass-top), 0 30px 70px rgba(0, 0, 0, 0.5); }
+.room-ic { background: var(--glass-well); border: 0; }
+.flyer { border-color: var(--glass-rim-a); }
+
+/* Data: the market rows are lines inside the glass panel, not boxes of their own. */
+.mrow { background: transparent; border-color: transparent; }
+.mrow:hover { border-color: transparent; background: rgba(255, 255, 255, 0.03); }
+.mrow.on { background: rgba(255, 255, 255, 0.06); border-color: transparent; }
+.tf-table td { border-top-color: rgba(255, 255, 255, 0.05); }
+
+.login-card { border-radius: 22px; }
+.sv-body { border-radius: 22px; }
+
+/* A test's page: glass only on the stat tiles and the settings table. The
+   score row, the charts and the trades sit on the backdrop, between hairlines. */
+.sv-stats { gap: 12px; }
+.sv-hero .sv-stat { border-left: 0; border-radius: 16px; padding: 14px 16px; }
+.sv-hero .sv-stat b { font-size: 18px; }
+.sv-sweep { border-radius: 20px; padding: 16px 18px 12px; }
+.sv-jcard { background: none; border: 0; box-shadow: none; padding: 4px 0 0; border-radius: 0; }
+.sv-fbar { background: rgba(255, 255, 255, 0.025); }
+
+@media (max-width: 900px) {
+  /* The nav pill takes its own row under the brand, scrolling sideways if it must. */
+  .nav { display: flex; flex-wrap: wrap; justify-content: space-between; }
+  .tabs { order: 3; width: 100%; overflow-x: auto; justify-content: flex-start; }
+}

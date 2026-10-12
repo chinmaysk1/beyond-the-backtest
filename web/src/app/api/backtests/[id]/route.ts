@@ -10,7 +10,8 @@ export const dynamic = 'force-dynamic';
 /* One job's status, and its result once done. The client polls this.
  *
  * A job is only visible to the user who queued it. For a finished backtest the
- * full-window run's trade list and equity curve are attached; they live on the
+ * continuous run's trade list and equity curve are attached (train start to
+ * the newest bar; older results have only train + test). They live on the
  * `runs` row rather than in the job result so a sweep's hundreds of rows do
  * not each carry a curve nobody draws.
  */
@@ -36,7 +37,7 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
     result: (job.result as Job['result']) ?? null,
   };
 
-  const fullRun = out.result?.runs?.full;
+  const fullRun = out.result?.runs?.all ?? out.result?.runs?.full;
   if (job.kind === 'backtest' && job.status === 'done' && fullRun) {
     const run = await prisma.runs.findUnique({
       where: { id: BigInt(fullRun) },
@@ -44,6 +45,14 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
     });
     out.trades = (run?.trades as Job['trades']) ?? [];
     out.curve = (run?.equity as Job['curve']) ?? undefined;
+    // The series' newest complete bar, so the page can tell when the holdout
+    // has fallen behind the market and needs bringing up to date.
+    const p = out.payload as { symbol?: string; timeframe?: string };
+    const meta = p.symbol && p.timeframe ? await prisma.series.findFirst({
+      where: { symbol: p.symbol, timeframe: p.timeframe }, orderBy: { row_count: 'desc' },
+      select: { last_ts: true },
+    }) : null;
+    if (meta?.last_ts) out.latestTs = Number(meta.last_ts);
   }
   return NextResponse.json(out);
 }

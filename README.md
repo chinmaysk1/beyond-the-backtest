@@ -22,7 +22,7 @@ backend/          Python — data layer, engine, statistics, worker
   btb/            the package
   tests/          regression tests
   universe.json   the curated symbol list
-web/              Next.js application (Weeks 9–11)
+web/              Next.js application
 proposal/         proposal and plan
 ```
 
@@ -217,6 +217,9 @@ Running a backtest always runs its sweep too. Details in `web/PLAN.md`.
 
 ## Status — Week 4, the verdict engine
 
+(Weeks 5–6 replaced the one-word label with a 0–100 score; see below. The
+checks are unchanged.)
+
 `backend/btb/verdict/`. Every sweep now ends in one word -- ROBUST, WEAK or
 OVERFIT -- and one sentence saying why, from three independent checks over one
 matrix of daily returns (every grid combination, run once over train + test):
@@ -267,7 +270,85 @@ test with its verdict, filterable.
 The cost: a sweep takes roughly twice as long, because every combination is run
 once more over the whole span. On one core that is still seconds.
 
+## Status — Weeks 5–6, a score instead of a word, and glass
+
+**The verdict is now a 0–100 score.** Three words hid too much: on real data
+almost everything was OVERFIT, so SPY 1h Bollinger + RSI (beat holding over a
+flat stretch) looked the same as NVDA Bollinger + RSI (lost 80% while holding
+made 41x). The three checks each already produce a probability, so the score
+is their product:
+
+    score = 100 x deflated Sharpe x (1 - PBO) x (walk-forward wins + 1) / (folds + 2)
+
+| Factor | What it is | On the page |
+|---|---|---|
+| Deflated Sharpe | P(this setting's true Sharpe > 0), after N settings tried | "Survives 81 settings tried" |
+| 1 - PBO | P(the training winner does not land in the bottom half out of sample) | "Holds up on unseen data" |
+| Walk-forward | Laplace's rule of succession over the 5 folds: P(the next period is up) | "Real-time picks made money, 5 of 5" |
+
+High only when all three agree; any one at zero vetoes it. The three are not
+independent, so the score is a confidence score built from probabilities, not
+itself a probability, and the page always shows the three factors beside it. A
+check that could not run counts as no evidence (1/2), never as a pass. The
+score does not say whether the strategy beat holding -- that is a different
+question, so every card and page shows return against buy-and-hold next to it.
+
+**What counts as high comes from calibration, not intuition.** On random walks
+with the real series' timestamps and volatility (50 walks x the six library
+strategies per market), the scores luck alone produces:
+
+| | p75 | p95 | scores >= 30 | scores >= 12 |
+|---|---|---|---|---|
+| SPY 1d | 11 | 29 | 15/300 (5.0%) | 73/300 (24%) |
+| BTC/USD 4h | 3 | 16 | 4/300 (1.3%) | 23/300 (8%) |
+
+So `high` starts at 30 (luck reaches it at most 5% of the time on either
+market) and `mid` at 12 (at most 25%). On the stored tests the live EMA-cross +
+ADX strategy on BTC 4h scores 57 (high), SPY 1h Bollinger + RSI 16 (mid), and the
+rest 0-8.
+
+```bash
+python -m btb.engine verdict   --strategy ema_cross_adx --symbol BTC/USD --timeframe 4h
+python -m btb.engine calibrate --symbol SPY --timeframe 1d --asset-class equity --walks 50
+python -m btb.engine rescore   --dry-run     # re-score stored verdicts from their stored numbers
+```
+
+`rules.py` holds the formula and the bands; `VERSION` is 2. Old verdicts were
+re-scored in place from the numbers they already held -- nothing re-ran.
+
+**Results is a grid of cards.** Each test is one card: the strategy, its market
+and timeframe, the score as a ring, the test-window return against holding, both
+curves over the test window (holding in blue), and the settings it ran with. A
+filters panel on the left searches, sorts (score, return, vs holding, newest),
+and narrows by minimum score, beat-holding, market and timeframe. A test's page
+keeps its layout; the verdict word and its three check columns became the score
+ring, the reason, and the three factors, and the settings table gained a Score
+column and a "score at least" slider.
+
+**The whole site is glass.** Clear glass on a static space backdrop, faintly
+tinted pink to yellow. The no-blur rule became a budget (see `web/PLAN.md`,
+"Glass"): cards and panels over the static backdrop are glass without blur;
+real blur only on the nav, the market list over the candles, menus and
+tooltips, and never inside a scrolling area. Scrolling 104 cards held 60 fps (240 frames in 4
+s, p95 17 ms) in headless Chrome.
+
+**The holdout is everything after the test window.** It used to be a locked
+final year nothing could see. Now it follows the test-end handle: end test
+earlier and the holdout grows, later and it shrinks (it always keeps at least
+100 bars). Every backtest runs the chosen settings over it, so a test's page
+has a Holdout tab -- how those settings did on data after everything they
+were picked on -- and the equity curve runs on into it. The holdout runs to the
+newest bar: when a test is opened and its holdout is missing (it ran before
+this change) or behind the market, an `extend` backtest reruns just the
+holdout on the newest bars and writes it back onto the test, leaving its
+train/test numbers and score as they were. Paper trading
+(weeks 9-12) is the forward test from live. Nothing that picks or scores
+settings reads the holdout: the sweep ranks on test, and the score is always
+computed on the default windows. One caveat when test is ended *earlier* than
+the default: the stretch between the new test end and the default holdout was
+not used to pick the settings, but the score's checks did see it.
+
 ## Next
 
-Weeks 5–8: the guided flow end to end -- the plain-English questions that pick
-a market and strategy, on top of the Strategies and Results tabs that exist.
+Weeks 7–8: the guided questions that pick a market and strategy, and strategies
+written in plain English through an LLM, with their UI.
