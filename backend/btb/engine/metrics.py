@@ -16,14 +16,16 @@ import math
 
 import numpy as np
 
-from .fills import Fills
+from .fills import EQ0, FEES, PNL, SLIP, Fills
 
 YEAR = 365.25 * 86400
 
 
 def compute(f: Fills, ts: np.ndarray, close: np.ndarray, *, capital: float,
             costs_dict: dict) -> dict:
-    trades = f.trades
+    # Trade columns, as lists: Python's sum and comparisons over the same
+    # doubles, in trade order, without building a Trade per row.
+    pnl, eq0 = f.column(PNL), f.column(EQ0)
     eq = f.equity
     n = len(eq)
     t0, t1 = int(ts[f.i0]), int(ts[f.i1])
@@ -54,11 +56,11 @@ def compute(f: Fills, ts: np.ndarray, close: np.ndarray, *, capital: float,
             sortino = float(np.mean(rets) / np.sqrt(np.mean(np.minimum(rets, 0) ** 2))
                             * math.sqrt(bars_per_year))
 
-    wins = [t.pnl for t in trades if t.pnl > 0]
-    losses = [-t.pnl for t in trades if t.pnl <= 0]
+    wins = [p for p in pnl if p > 0]
+    losses = [-p for p in pnl if p <= 0]
     gp, gl = sum(wins), sum(losses)
-    fees = sum(t.fees for t in trades)
-    slip = sum(t.slip for t in trades)
+    fees = sum(f.column(FEES))
+    slip = sum(f.column(SLIP))
     bh = float(close[f.i1] / close[f.i0] - 1)
 
     return {
@@ -67,11 +69,11 @@ def compute(f: Fills, ts: np.ndarray, close: np.ndarray, *, capital: float,
         "max_dd_pct": _r(dd * 100),
         "sharpe": _r(sharpe, 3),
         "sortino": _r(sortino, 3),
-        "trades": len(trades),
-        "win_pct": _r(len(wins) / len(trades) * 100) if trades else None,
+        "trades": len(pnl),
+        "win_pct": _r(len(wins) / len(pnl) * 100) if pnl else None,
         "profit_factor": _r(gp / gl, 3) if gl > 0 else None,
-        "avg_trade_pct": _r(float(np.mean([t.pnl / t.equity_at_entry for t in trades])) * 100)
-                         if trades else None,
+        "avg_trade_pct": _r(float(np.mean([p / e for p, e in zip(pnl, eq0)])) * 100)
+                         if pnl else None,
         "exposure_pct": _r(float(f.in_pos.mean()) * 100) if n else 0.0,
         "bh_pct": _r(bh * 100),
         "fees": _r(fees, 2),

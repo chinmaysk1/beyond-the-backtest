@@ -59,9 +59,10 @@ def ema(src, n: int) -> np.ndarray:
     k = 2.0 / (n + 1.0)
     run = None
     seen = 0
-    for i in range(len(x)):
-        v = float(x[i])
-        if _isnan(v):
+    # A list, not the array: reading a numpy element per bar boxes a scalar,
+    # which costs more than the arithmetic. Same doubles, same order.
+    for i, v in enumerate(x.tolist()):
+        if v != v:
             continue
         run = v if run is None else (v - run) * k + run
         seen += 1
@@ -79,9 +80,8 @@ def rma(src, n: int) -> np.ndarray:
     x = _arr(src)
     out = np.full(len(x), NAN)
     run = None
-    for i in range(len(x)):
-        v = float(x[i])
-        if _isnan(v):
+    for i, v in enumerate(x.tolist()):          # a list for speed, as in ema
+        if v != v:
             continue
         if run is None:
             if i + 1 >= n:

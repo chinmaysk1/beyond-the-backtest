@@ -257,7 +257,7 @@ def sweep_series(spec: dict, series: B.Series, costs: Costs, *, fill: str = "clo
             m = done(w.name, p) if done else None
             if m is None:
                 r = B.run(spec, p, series, window=(w.start, w.end), costs=costs,
-                          fill=fill, with_curve=False)
+                          fill=fill, with_curve=False, with_trades=False)
                 m = r.metrics
                 if record:
                     record(w.name, p, r)

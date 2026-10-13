@@ -838,8 +838,10 @@ def _exit_level(node, params, ev):
     if mult <= 0:
         return None
     n = _length(ev.value(node.get("len", 14)))
+    # Through the evaluator, so the ATR is memoised on the Frame like any
+    # indicator: a sweep computes it once, not once per combination.
     return {"kind": "atr", "mult": mult,
-            "dist": I.atr(ev.f.high, ev.f.low, ev.f.close, n) * mult}
+            "dist": ev.value({"fn": "atr", "len": n}) * mult}
 
 
 # -- self-description ------------------------------------------------------------------

@@ -79,7 +79,11 @@ def run(spec: dict, params: dict | None, series: Series, *,
         window: tuple[int, int] | None = None, costs: Costs | None = None,
         capital: float = 10_000.0, size_pct: float = 100.0, leverage: float = 1.0,
         fill: str = "close", stop_fill: str = "gap", close_open: bool = True,
-        liquidate: bool = True, with_curve: bool = True) -> Result:
+        liquidate: bool = True, with_curve: bool = True,
+        with_trades: bool = True) -> Result:
+    """`with_curve` / `with_trades` False skip building the stored curve and
+    the per-trade dicts; a sweep keeps neither, and a high-frequency grid can
+    make thousands of trades per run. Metrics are the same either way."""
     S.load(spec)
     p = S.resolve_params(spec, params)
     costs = costs or Costs()
@@ -93,7 +97,7 @@ def run(spec: dict, params: dict | None, series: Series, *,
     m = M.compute(fills, f.ts, f.close, capital=capital, costs_dict=costs.as_dict())
     return Result(
         metrics=m,
-        trades=[t.as_dict() for t in fills.trades],
+        trades=[t.as_dict() for t in fills.trades] if with_trades else [],
         curve=M.curve(fills, f.ts, f.close, capital=capital) if with_curve else {},
         fills=fills,
         window=(int(f.ts[i0]), int(f.ts[i1])),
