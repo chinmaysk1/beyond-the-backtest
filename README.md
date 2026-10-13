@@ -174,7 +174,7 @@ python -m btb.engine run ... --csv FILE    # fully offline, no database
 |---|---|
 | `spec.py` | The spec language: composable primitives (sources, arithmetic, series ops, averages, Pine-exact named indicators, higher-timeframe nodes, conditions). Validates with exact error paths; generates its own JSON Schema. |
 | `indicators.py`, `timeframes.py` | The maths. Wilder smoothing where Pine uses it; higher timeframes grouped by wall-clock bucket and shifted one bar. |
-| `fills.py`, `metrics.py` | The position loop and the numbers. |
+| `fills.py`, `metrics.py` | The position loop (compiled with numba when installed) and the numbers. |
 | `windows.py`, `jobs.py`, `worker.py` | Train/test/holdout from bars actually held; backtest and sweep jobs; the queue worker. |
 | `refresh.py` | Keeps stored series current. Runs in the worker whenever the queue is empty. |
 
@@ -347,6 +347,24 @@ settings reads the holdout: the sweep ranks on test, and the score is always
 computed on the default windows. One caveat when test is ended *earlier* than
 the default: the stretch between the new test end and the default holdout was
 not used to pick the settings, but the score's checks did see it.
+
+## Status — Week 7, sweeps on short timeframes
+
+**"Still seconds" held only on 4h.** The first 15m grid (`panic_fade` on BTC/USD,
+500 combinations) took 454 s on the server: 15m has 16× the bars, and the
+profile put the time somewhere unexpected. 54% went to the ATR behind ATR stops
+and targets, which bypassed the evaluator's memo and was recomputed per run;
+18% to formatting ~4,000 trades per run that a sweep never stores; 22% to the
+fill loop. The ATR is now memoised like any indicator, sweep and verdict runs
+skip the trade dicts, and the fill loop is compiled with numba. The same grid
+takes 35 s on one server core.
+
+**Same results, bit for bit.** The compiled loop follows the old one block for
+block, without `fastmath`, so every operation is the same IEEE double operation
+Python does, in the same order. Without numba installed the same source runs as
+plain Python. Old engine against new over 455 configurations (every library
+strategy, both fill modes, both stop fills, 1× and 5× leverage, train, test and
+the verdict's return matrix) differ in 0, on the laptop and on the ARM server.
 
 ## Next
 
