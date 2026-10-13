@@ -72,7 +72,7 @@ def build(spec: dict, series: B.Series, costs: Costs, *, split: W.Split | None =
     cols, trades = [], []
     for p in combos:
         r = B.run(spec, p, series, window=(span.start, span.end), costs=costs,
-                  fill=fill, with_curve=False)
+                  fill=fill, with_curve=False, with_trades=False)
         d, col = daily(r.fills.equity, ts)
         if len(d) != len(days):           # equity is filled every bar; guard anyway
             col = _align(d, col, days)

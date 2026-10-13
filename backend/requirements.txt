@@ -2,5 +2,6 @@
 ccxt>=4.5              # crypto OHLCV, many venues behind one interface
 pandas>=2.0            # frame plumbing
 numpy>=1.24            # the numerical core
+numba>=0.59            # compiles the fill loop (engine/fills.py); optional, same results without
 psycopg[binary]>=3.1   # Postgres driver
 pytest>=7.0            # tests
