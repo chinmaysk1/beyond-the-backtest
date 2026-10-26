@@ -122,6 +122,13 @@ The database password lives in `backend/.env.local` (gitignored) and on the box
 in `~/btb/.pgpass`. It is passed to containers through the environment and is
 never baked into an image.
 
+No file in this repo holds a database URL with credentials, not even a
+placeholder one: `up.sh` assembles the web app's `DATABASE_URL` from
+`BTB_DB_PASSWORD` at run time, and `docker-compose.yml` takes it whole from
+`BTB_DATABASE_URL` (`postgresql://btb` + `:` + the URL-encoded password +
+`@btb-postgres:5432/btb`). Secret scanners flag the `user:password@host` shape
+even when the password is a `${...}` placeholder.
+
 ## Firewall note
 
 Opening a port on Oracle Cloud takes **two** changes: the OCI security list in

@@ -108,7 +108,9 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://btb:${BTB_DB_PASSWORD:?set BTB_DB_PASSWORD}@btb-postgres:5432/btb
+      # The whole URL, built outside this file (see up.sh), so no credential --
+      # not even a placeholder in user:password@host form -- appears here.
+      DATABASE_URL: ${BTB_DATABASE_URL:?set BTB_DATABASE_URL -- the Postgres URL for btb-postgres, see deploy/README.md}
       SESSION_SECRET: ${BTB_SESSION_SECRET:?set BTB_SESSION_SECRET (32+ characters)}
       BTB_PUBLIC_URL: https://${BTB_DOMAIN:?set BTB_DOMAIN}
       TZ: UTC

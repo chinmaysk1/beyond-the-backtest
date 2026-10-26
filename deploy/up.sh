@@ -78,10 +78,14 @@ echo "checker started"
 if [ -n "${BTB_DOMAIN:-}" ]; then
   : "${BTB_SESSION_SECRET:?set BTB_SESSION_SECRET (32+ characters)}"
   docker build -q -t btb-web "$(dirname "$0")/../web" >/dev/null
+  # Assembled here from the password in the environment (URL-encoded), so no
+  # file holds a database URL with credentials in it.
+  db_creds="btb:$(printf '%s' "$BTB_DB_PASSWORD" | python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=""))')"
+  db_url="postgresql://${db_creds}@btb-postgres:5432/btb"
   docker rm -f btb-web >/dev/null 2>&1 || true
   docker run -d --name btb-web --network "$NET" --restart unless-stopped \
     --cpus=0.75 --memory=1g \
-    -e DATABASE_URL="postgresql://btb:${BTB_DB_PASSWORD}@btb-postgres:5432/btb" \
+    -e DATABASE_URL="$db_url" \
     -e SESSION_SECRET="$BTB_SESSION_SECRET" -e BTB_PUBLIC_URL="https://$BTB_DOMAIN" -e TZ=UTC \
     btb-web >/dev/null
   echo "web started"
