@@ -4,6 +4,9 @@ const config = {
   // bundled. The auth routes also declare `runtime = 'nodejs'` for the same
   // reason.
   serverExternalPackages: ['@node-rs/argon2', '@prisma/client'],
+  // The production image runs the self-contained server Next traces into
+  // .next/standalone, not a full node_modules (see Dockerfile).
+  output: 'standalone',
 };
 
 export default config;

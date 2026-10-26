@@ -5,9 +5,13 @@ import type { Band } from '../lib/types';
  * reaches at most 5% of the time. */
 export const BAND_TONE: Record<Band, string> = { high: 'good', mid: 'warn', low: 'bad' };
 
-export default function ScoreRing({ score, band, size = 'md', title }: {
+export default function ScoreRing({ score, band, size = 'md', title, unscored = false }: {
   score: number | null; band: Band | null; size?: 'sm' | 'md' | 'lg'; title?: string;
+  unscored?: boolean;    // a script with no // @grid lines: there is no score to wait for
 }) {
+  if (unscored) {
+    return <span className={`ring ${size} none`} title={title} role="img" aria-label="Not scored"><b>–</b></span>;
+  }
   if (score == null || band == null) {
     return <span className={`ring ${size} pending`} title={title}><b>…</b></span>;
   }

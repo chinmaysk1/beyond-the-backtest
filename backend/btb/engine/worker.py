@@ -32,14 +32,27 @@ from .spec import SpecError
 from .refresh import refresh_once
 
 
+def _brief(payload) -> str:
+    """A payload for the log: a whole Pine script would drown it."""
+    if isinstance(payload, dict) and isinstance(payload.get("source"), str):
+        payload = {**payload, "source": f"<{len(payload['source'])} chars>"}
+    return str(payload)[:300]
+
+
 def _log(msg: str) -> None:
     print(time.strftime("%Y-%m-%d %H:%M:%S ") + msg, flush=True)
 
 
 def run(*, name: str | None = None, refresh: bool = True, refresh_every: float = 300,
-        poll: float = 1.0, once: bool = False) -> None:
+        poll: float = 1.0, once: bool = False, kinds: list[str] | None = None) -> None:
+    """`kinds` limits what this worker claims. The deployment runs two: one
+    for backtests and sweeps, and a checker that only answers `check` jobs, so
+    a long sweep never makes the Strategies page wait for a syntax check."""
     name = name or f"{socket.gethostname()}:{os.getpid()}"
-    kinds = list(HANDLERS)
+    kinds = list(kinds or HANDLERS)
+    unknown = sorted(set(kinds) - set(HANDLERS))
+    if unknown:
+        raise SystemExit(f"unknown job kinds {unknown}; have {sorted(HANDLERS)}")
     backoff = 1.0
     last_refresh = 0.0
     _log(f"worker {name} up; kinds={kinds} refresh={'every %ds' % refresh_every if refresh else 'off'}")
@@ -80,7 +93,7 @@ def run(*, name: str | None = None, refresh: bool = True, refresh_every: float =
 
 def _handle(conn, job: dict) -> None:
     jid, kind = job["id"], job["kind"]
-    _log(f"job {jid} {kind} {job['payload']}")
+    _log(f"job {jid} {kind} {_brief(job['payload'])}")
     t0 = time.perf_counter()
     try:
         result = HANDLERS[kind](conn, job["payload"] or {}, job_id=jid,

@@ -1,20 +1,26 @@
 """`python -m btb.engine <command>` -- the engine's interface.
 
     library [--sync]              list the built-in strategies; --sync loads them into the DB
-    validate FILE                 check a spec file; prints every error with its path
-    schema | catalog              the spec's JSON Schema / function catalog (what an AI is shown)
-    run    --strategy S --symbol X --timeframe T [--param k=v ...] [--csv FILE]
-    sweep  --strategy S --symbol X --timeframe T [--csv FILE] [--save]
-    verdict --strategy S --symbol X --timeframe T [--csv FILE]
+    check FILE.pine               check a script: errors and warnings with line numbers, the
+                                  inputs, the grid and N, the costs
+    reference                     the Pine contract a model is shown (REFERENCE.md)
+    run    (--strategy S | --file F) --symbol X --timeframe T [--param k=v ...] [--csv FILE]
+    sweep  (--strategy S | --file F) --symbol X --timeframe T [--csv FILE] [--save]
+    verdict (--strategy S | --file F) --symbol X --timeframe T [--csv FILE]
     calibrate --timeframe T [--csv FILE | --symbol X] [--walks N] [--strategy S ...]
     rescore [--dry-run] [--force]  re-score stored verdicts from their stored numbers
     enqueue backtest|sweep --strategy S --symbol X --timeframe T [--param k=v ...]
-    worker [--no-refresh] [--once]
+    worker [--no-refresh] [--once] [--kinds check]
     refresh                       fetch newly closed bars for every due series, once
+
+Strategies are Pine. `--strategy` names a library script (btb/pine/library);
+`--file` runs any .pine file. `--legacy` runs the retired JSON library instead
+(btb/engine/library), which is now only the oracle the Pine ports are tested
+against.
 
 `run`, `sweep`, `verdict` and `calibrate` read from the database unless given
 --csv, which runs fully offline on a file with columns time|ts, open, high, low,
-close, volume.
+close, volume. Pine needs the worker image (PineForge); --legacy runs anywhere.
 """
 from __future__ import annotations
 
@@ -28,7 +34,6 @@ import pandas as pd
 
 from . import backtest as B
 from . import library as L
-from . import spec as S
 from . import windows as W
 from .fills import Costs, default_costs
 
@@ -41,6 +46,29 @@ def _params(pairs) -> dict:
             raise SystemExit(f"--param expects k=v, got {p!r}")
         out[k] = float(v) if "." in v else int(v)
     return out
+
+
+def _strategy(args):
+    """("pine", Program) or ("json", spec) for the command's strategy."""
+    if getattr(args, "legacy", False):
+        return "json", L.get(args.strategy)
+    from ..pine import library as PL
+    from ..pine.program import PineError, Program
+    if getattr(args, "file", None):
+        src = Path(args.file).read_text(encoding="utf-8")
+    else:
+        lib = PL.sources()
+        if args.strategy not in lib:
+            raise SystemExit(f"no library strategy {args.strategy!r}; have {sorted(lib)}")
+        src = lib[args.strategy]
+    try:
+        return "pine", Program.from_source(src)
+    except PineError as e:
+        raise SystemExit("\n".join(e.messages)) from None
+
+
+def _name(kind, strat) -> str:
+    return strat.title if kind == "pine" else strat.get("title", strat["name"])
 
 
 def _costs(args, asset_class) -> Costs:
@@ -73,74 +101,108 @@ def _fmt(m: dict) -> str:
 # -- commands -------------------------------------------------------------------------
 
 def cmd_library(args) -> int:
-    lib = L.load_all()
-    for name, spec in lib.items():
-        combos, raw = S.grid(spec)
-        print(f"{name:20} {spec.get('style', ''):15} {len(combos):>3} combos  "
-              f"{spec.get('title', '')}")
+    from ..pine import library as PL
+    for name, r in PL.load_all().items():
+        style = PL.spec_of(name, r)["style"]
+        print(f"{name:20} {style:15} {r.grid.n:>4} combos  {r.title}")
     if args.sync:
         from .. import db
         with db.connect() as conn:
-            for name, sid in L.sync(conn):
+            for name, sid in PL.sync(conn):
                 print(f"synced {name} -> {sid}")
     return 0
 
 
-def cmd_validate(args) -> int:
-    spec = json.loads(Path(args.file).read_text(encoding="utf-8"))
-    errs = S.validate(spec)
-    for e in errs:
-        print(e)
-    print("valid" if not errs else f"{len(errs)} error(s)")
-    return 1 if errs else 0
+def cmd_check(args) -> int:
+    from ..pine.check import check
+    r = check(Path(args.file).read_text(encoding="utf-8"))
+    for m in r.errors:
+        print(f"error   {m}")
+    for m in r.warnings:
+        print(f"warning {m}")
+    if r.ok:
+        for i in r.inputs:
+            swept = r.grid.values.get(i.name)
+            print(f"  input {i.name or '-':16} {i.type:6} default {i.default!s:8}"
+                  + (f" swept {swept}" if swept else ""))
+        print(f"{r.title}: ok, {r.grid.n} combination(s)"
+              + ("" if r.grid.scored else " (no @grid: runs once, unscored)")
+              + f"; costs {'from the script' if r.costs.set else 'asset-class defaults'}")
+    return 0 if r.ok else 1
 
 
-def cmd_schema(args) -> int:
-    print(json.dumps(S.json_schema(), indent=2))
+def cmd_reference(args) -> int:
+    from ..pine import reference
+    print(reference.text())
     return 0
 
 
-def cmd_catalog(args) -> int:
-    print(json.dumps(S.catalog(), indent=2))
-    return 0
+def _pine_costs(prog, costs: Costs) -> str:
+    _, c = prog.cost_overrides(costs)
+    if c["source"] == "script":
+        return f"script's costs: {c['commission_value']} {c['commission_type']} + {c['slippage_ticks']} ticks"
+    return f"default costs {costs.commission_pct}% + {costs.slippage_bps} bps, charged as {c['charged_pct_per_side']}% a side"
 
 
 def cmd_run(args) -> int:
-    spec = L.get(args.strategy)
+    kind, strat = _strategy(args)
     series = _series(args)
     costs = _costs(args, series.asset_class)
     split = W.split(series.ts)
-    print(f"{spec['title']} on {series.symbol} {series.timeframe}  "
-          f"({len(series.ts)} bars, costs {costs.commission_pct}% + {costs.slippage_bps} bps, "
-          f"adjust {series.adjust})")
-    for w in (split.train, split.test, split.full()):
-        t = time.perf_counter()
-        r = B.run(spec, _params(args.param), series, window=(w.start, w.end), costs=costs,
-                  fill=args.fill, with_curve=False)
+    wins = (split.train, split.test, split.full())
+    desc = (_pine_costs(strat, costs) if kind == "pine"
+            else f"costs {costs.commission_pct}% + {costs.slippage_bps} bps")
+    print(f"{_name(kind, strat)} on {series.symbol} {series.timeframe}  "
+          f"({len(series.ts)} bars, {desc}, adjust {series.adjust})")
+    t = time.perf_counter()
+    if kind == "pine":
+        from ..pine.program import run_windows
+        results = run_windows(strat, series, costs, strat.resolve_params(_params(args.param)),
+                              [(w.start, w.end) for w in wins], [False] * len(wins))
+    else:
+        results = [B.run(strat, _params(args.param), series, window=(w.start, w.end),
+                         costs=costs, fill=args.fill, with_curve=False) for w in wins]
+    for w, r in zip(wins, results):
         print(f"  {w.name:6} {pd.Timestamp(w.start, unit='s'):%Y-%m-%d}..{pd.Timestamp(w.end, unit='s'):%Y-%m-%d}"
-              f"  {_fmt(r.metrics)}  ({time.perf_counter() - t:.2f}s)")
+              f"  {_fmt(r.metrics)}")
+    print(f"  ({time.perf_counter() - t:.2f}s)")
     if split.thin_sample:
         print("  thin sample: under two years of data")
     return 0
 
 
+def _sweep(kind, strat, series, costs, fill):
+    from .jobs import pine_sweep_series, sweep_series
+    if kind == "pine":
+        out = pine_sweep_series(strat, series, costs)
+        out.pop("_window_bounds", None)
+        for r in out["rows"]:
+            r.pop("_metrics", None)
+        return out
+    return sweep_series(strat, series, costs, fill=fill)
+
+
 def cmd_sweep(args) -> int:
-    from .jobs import sweep_series
-    spec = L.get(args.strategy)
+    kind, strat = _strategy(args)
     if args.save and not args.csv:
+        if kind != "pine" or args.file:
+            raise SystemExit("--save runs a library strategy through the worker's job")
         from .. import db
+        from ..pine import library as PL
         from .jobs import sweep_job
         with db.connect() as conn:
-            L.sync(conn)
+            PL.sync(conn)
             out = sweep_job(conn, {"strategy": args.strategy, "symbol": args.symbol,
                                    "timeframe": args.timeframe})
     else:
         series = _series(args)
         costs = _costs(args, series.asset_class)
         t0 = time.perf_counter()
-        out = sweep_series(spec, series, costs, fill=args.fill)
+        out = _sweep(kind, strat, series, costs, args.fill)
+        out.pop("matrix", None)
         out["seconds"] = round(time.perf_counter() - t0, 2)
-    print(f"{out['combos']} combos x 2 windows = {out['evaluated']} runs in {out['seconds']}s "
+    per = out.get("runs_per_combination", 2)
+    print(f"{out['combos']} combos x {per} run(s) = {out['combos'] * per} runs in {out['seconds']}s "
           f"({out.get('reused', 0)} reused); train/test rank correlation {out['rank_corr']}")
     for r in out["top"]:
         print(f"  #{r['test_rank']:<3} train #{r['train_rank']:<3} {json.dumps(r['params'])}")
@@ -151,13 +213,12 @@ def cmd_sweep(args) -> int:
 
 def cmd_verdict(args) -> int:
     from .. import verdict as V
-    from .jobs import sweep_series
-    spec = L.get(args.strategy)
+    kind, strat = _strategy(args)
     series = _series(args)
     costs = _costs(args, series.asset_class)
-    v = V.evaluate(spec, series, costs, sweep_series(spec, series, costs, fill=args.fill),
-                   fill=args.fill)
-    _print_verdict(args.strategy, v)
+    sw = _sweep(kind, strat, series, costs, args.fill)
+    v = V.evaluate(strat, series, costs, sw, fill=args.fill, matrix=sw.pop("matrix", None))
+    _print_verdict(args.strategy or args.file, v)
     for rank, r in v["rows"].items():
         print(f"  #{rank:<3} score {r['score']:>3}  dsr {r['dsr']}  {json.dumps(r['params'])}")
     return 0
@@ -182,11 +243,18 @@ def cmd_calibrate(args) -> int:
     import numpy as np
     from .. import verdict as V
     from ..verdict import rules
-    from .jobs import sweep_series
     real = _series(args)
     close = real.frame.close
     vol = float(np.std(np.diff(np.log(close))))
-    names = args.strategy or sorted(L.load_all())
+    if args.legacy:
+        names = args.strategy or sorted(L.load_all())
+        strategies = {n: ("json", L.get(n)) for n in names}
+    else:
+        from ..pine import library as PL
+        from ..pine.program import Program
+        lib = PL.sources()
+        names = args.strategy or sorted(lib)
+        strategies = {n: ("pine", Program.from_source(lib[n])) for n in names}
     rng = np.random.default_rng(args.seed)
     scores = {n: [] for n in names}
     for i in range(args.walks):
@@ -196,8 +264,9 @@ def cmd_calibrate(args) -> int:
         walk = B.Series.from_frame(df, real.timeframe, asset_class=real.asset_class)
         costs = _costs(args, walk.asset_class)
         for n in names:
-            spec = L.get(n)
-            v = V.evaluate(spec, walk, costs, sweep_series(spec, walk, costs), fill=args.fill)
+            kind, strat = strategies[n]
+            sw = _sweep(kind, strat, walk, costs, args.fill)
+            v = V.evaluate(strat, walk, costs, sw, fill=args.fill, matrix=sw.pop("matrix", None))
             scores[n].append(v["score"])
         print(f"walk {i + 1}/{args.walks}", file=sys.stderr)
     hi = rules.BANDS["high"]
@@ -248,8 +317,9 @@ def cmd_enqueue(args) -> int:
     payload = {"strategy": args.strategy, "symbol": args.symbol, "timeframe": args.timeframe}
     if args.param:
         payload["params"] = _params(args.param)
+    from ..pine import library as PL
     with db.connect() as conn:
-        L.sync(conn)
+        PL.sync(conn)
         jid = db.enqueue_job(conn, args.kind, payload)
         conn.commit()
     print(f"queued job {jid}")
@@ -258,10 +328,14 @@ def cmd_enqueue(args) -> int:
 
 def cmd_worker(args) -> int:
     from .. import db
+    from ..pine import library as PL
     from .worker import run
-    with db.connect() as conn:
-        L.sync(conn)
-    run(refresh=not args.no_refresh, once=args.once)
+    kinds = [k.strip() for k in args.kinds.split(",")] if args.kinds else None
+    if not kinds or set(kinds) - {"check"}:
+        with db.connect() as conn:
+            PL.sync(conn)
+    run(refresh=not args.no_refresh, once=args.once, kinds=kinds,
+        poll=args.poll)
     return 0
 
 
@@ -283,14 +357,18 @@ def main(argv=None) -> int:
     lib.add_argument("--sync", action="store_true", help="load them into the database")
     lib.set_defaults(fn=cmd_library)
 
-    v = sub.add_parser("validate", help="validate a spec file")
-    v.add_argument("file")
-    v.set_defaults(fn=cmd_validate)
-    sub.add_parser("schema", help="print the spec JSON Schema").set_defaults(fn=cmd_schema)
-    sub.add_parser("catalog", help="print the function catalog").set_defaults(fn=cmd_catalog)
+    ck = sub.add_parser("check", help="check a Pine script")
+    ck.add_argument("file")
+    ck.set_defaults(fn=cmd_check)
+    sub.add_parser("reference", help="print the Pine contract (REFERENCE.md)").set_defaults(
+        fn=cmd_reference)
 
     def market(sp, csv=True):
-        sp.add_argument("--strategy", required=True)
+        who = sp.add_mutually_exclusive_group(required=True)
+        who.add_argument("--strategy", help="a library strategy")
+        who.add_argument("--file", help="a .pine file")
+        sp.add_argument("--legacy", action="store_true",
+                        help="the retired JSON library strategy of that name")
         sp.add_argument("--symbol")
         sp.add_argument("--timeframe", required=True)
         sp.add_argument("--param", action="append", help="k=v, repeatable")
@@ -316,6 +394,7 @@ def main(argv=None) -> int:
 
     cb = sub.add_parser("calibrate", help="what scores luck alone reaches, on random walks")
     cb.add_argument("--strategy", action="append", help="repeatable; default every library strategy")
+    cb.add_argument("--legacy", action="store_true", help="the retired JSON library")
     cb.add_argument("--symbol")
     cb.add_argument("--timeframe", required=True)
     cb.add_argument("--commission", type=float, help="% per leg")
@@ -341,6 +420,8 @@ def main(argv=None) -> int:
     w = sub.add_parser("worker", help="claim and run jobs; refresh data when idle")
     w.add_argument("--no-refresh", action="store_true")
     w.add_argument("--once", action="store_true", help="handle one job (or one idle cycle) and exit")
+    w.add_argument("--kinds", help="comma-separated job kinds to claim (default: all)")
+    w.add_argument("--poll", type=float, default=1.0, help="seconds between queue checks")
     w.set_defaults(fn=cmd_worker)
 
     rf = sub.add_parser("refresh", help="fetch newly closed bars for due series")

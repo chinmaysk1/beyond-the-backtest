@@ -1,0 +1,31 @@
+//@version=6
+// @description Buy when RSI climbs back up out of oversold territory; sell once it recovers or after a fixed number of bars.
+// @style mean-reversion
+// @timeframes 4h, 1d
+strategy("RSI recovery", overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+     process_orders_on_close=true)
+
+rsi_len    = input.int(14, "RSI length", minval=1)
+level      = input.float(30, "Oversold level", minval=0, maxval=100)
+exit_level = input.float(60, "Exit level", minval=0, maxval=100)
+stop_pct   = input.float(8, "Stop loss %", minval=0)
+max_bars   = input.int(30, "Maximum bars held", minval=1)
+// @grid rsi_len    = 7, 14
+// @grid level      = 25, 30, 35
+// @grid exit_level = 50, 60, 70
+// @constraint level < exit_level
+
+r = ta.rsi(close, rsi_len)
+
+if strategy.position_size > 0
+    held = bar_index - strategy.opentrades.entry_bar_index(0)
+    if r > exit_level or held >= max_bars
+        strategy.close("Long")
+if ta.crossover(r, level)
+    strategy.entry("Long", strategy.long)
+    if stop_pct > 0
+        strategy.exit("Long stop", "Long", stop=close * (1 - stop_pct / 100))
+if strategy.position_size > 0 and stop_pct > 0
+    strategy.exit("Long stop", "Long", stop=strategy.position_avg_price * (1 - stop_pct / 100))

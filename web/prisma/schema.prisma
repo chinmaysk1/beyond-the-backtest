@@ -106,10 +106,14 @@ model strategies {
   spec       Json
   spec_sha   String
   created_at DateTime @default(now()) @db.Timestamptz(6)
+  language   String   @default("json")
+  source     String?
+  source_sha String?
   runs       runs[]
   users      users?   @relation(fields: [user_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
   @@index([name, created_at(sort: Desc)], map: "strategies_name")
+  @@index([user_id, source_sha], map: "strategies_source_sha")
 }
 
 model universe {
@@ -124,13 +128,54 @@ model universe {
 }
 
 model users {
-  id            String       @id @db.Uuid
-  email         String?      @unique
-  created_at    DateTime     @default(now()) @db.Timestamptz(6)
-  username      String?      @unique
+  id            String        @id @db.Uuid
+  email         String?       @unique
+  created_at    DateTime      @default(now()) @db.Timestamptz(6)
+  username      String?       @unique
   password_hash String?
+  api_tokens    api_tokens[]
   jobs          jobs[]
+  oauth_codes   oauth_codes[]
   strategies    strategies[]
 }
 
+model oauth_clients {
+  client_id     String        @id
+  name          String?
+  redirect_uris String[]
+  created_at    DateTime      @default(now()) @db.Timestamptz(6)
+  api_tokens    api_tokens[]
+  oauth_codes   oauth_codes[]
+}
 
+model oauth_codes {
+  code_hash      String        @id
+  client_id      String
+  user_id        String        @db.Uuid
+  redirect_uri   String
+  code_challenge String
+  scope          String
+  expires_at     DateTime      @db.Timestamptz(6)
+  used_at        DateTime?     @db.Timestamptz(6)
+  oauth_clients  oauth_clients @relation(fields: [client_id], references: [client_id], onDelete: Cascade, onUpdate: NoAction)
+  users          users         @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model api_tokens {
+  id            String         @id @db.Uuid
+  user_id       String         @db.Uuid
+  token_hash    String         @unique
+  kind          String
+  client_id     String?
+  name          String?
+  scope         String
+  created_at    DateTime       @default(now()) @db.Timestamptz(6)
+  last_used_at  DateTime?      @db.Timestamptz(6)
+  expires_at    DateTime?      @db.Timestamptz(6)
+  revoked_at    DateTime?      @db.Timestamptz(6)
+  oauth_clients oauth_clients? @relation(fields: [client_id], references: [client_id], onDelete: Cascade, onUpdate: NoAction)
+  users         users          @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([user_id, kind], map: "api_tokens_user")
+}

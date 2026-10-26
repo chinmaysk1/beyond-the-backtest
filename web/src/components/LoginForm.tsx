@@ -5,7 +5,7 @@ import { useState } from 'react';
 
 import Brand from './Brand';
 
-export default function LoginForm() {
+export default function LoginForm({ next = '/' }: { next?: string }) {
   const router = useRouter();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -30,7 +30,7 @@ export default function LoginForm() {
       }
       // refresh() re-runs the server component, which re-reads the session
       // cookie the response just set.
-      router.replace('/');
+      router.replace(next);
       router.refresh();
     } catch {
       setError('Could not reach the server');

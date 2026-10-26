@@ -1,0 +1,23 @@
+//@version=6
+// @description Go long when a fast moving average crosses above a slow one, short when it crosses below.
+// @style trend
+// @timeframes 4h, 1d
+strategy("EMA cross", overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+     process_orders_on_close=true)
+
+fast = input.int(20, "Fast EMA length", minval=1)
+slow = input.int(100, "Slow EMA length", minval=1)
+// @grid fast = 10, 20, 50
+// @grid slow = 50, 100, 200
+// @constraint fast < slow
+
+fast_ema = ta.ema(close, fast)
+slow_ema = ta.ema(close, slow)
+
+// An entry against an open position reverses it on the same close.
+if ta.crossover(fast_ema, slow_ema)
+    strategy.entry("Long", strategy.long)
+if ta.crossunder(fast_ema, slow_ema)
+    strategy.entry("Short", strategy.short)

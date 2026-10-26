@@ -31,13 +31,18 @@ from ..engine.fills import Costs
 from . import cscv, dsr, returns, rules, walkforward
 
 
-def evaluate(spec: dict, series: B.Series, costs: Costs, sweep: dict | None = None, *,
-             fill: str = "close", split: W.Split | None = None) -> dict:
+def evaluate(spec, series: B.Series, costs: Costs, sweep: dict | None = None, *,
+             fill: str = "close", split: W.Split | None = None,
+             matrix: returns.Matrix | None = None) -> dict:
     """Score a grid. `sweep` is sweep_series' result; every test-ranked row
-    gets its own score, and its #1 row is the headline."""
+    gets its own score, and its #1 row is the headline.
+
+    A Pine sweep passes `matrix`: its daily returns come from the same one run
+    per combination that produced the train and test numbers, so nothing is
+    run twice. Without it (a JSON spec) the matrix is built here."""
     t0 = time.perf_counter()
     split = split or W.split(series.ts)
-    mx = returns.build(spec, series, costs, split=split, fill=fill)
+    mx = matrix if matrix is not None else returns.build(spec, series, costs, split=split, fill=fill)
     n = len(mx.combos)
     years = len(mx.days) / 365.25
 

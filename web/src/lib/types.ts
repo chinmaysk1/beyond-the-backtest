@@ -22,6 +22,8 @@ export type AdjustMode = 'none' | 'split' | 'total';
 
 export type StrategyInfo = {
   name: string;
+  language?: 'pine' | 'json';
+  source?: string;         // the Pine, for "Edit as Pine"
   title: string;
   description: string;
   style: string;
@@ -138,11 +140,16 @@ export type TestSummary = {
   thin: boolean;                       // less than two years, or too few trades to judge
   custom: boolean;                     // run on moved windows
   spark: { equity: number[]; bh: number[] };   // the test window, both rebased to 1, ~40 points
+  unscored: boolean;                   // a script with no // @grid lines: one setting, no score
+  zeroCosts: boolean;                  // the script set commission and slippage to 0
+  legacy: boolean;                     // made with the retired JSON format: read-only
+  via: string | null;                  // 'mcp' when the user's own AI started it
 };
 
 export type Job = {
   id: number;
   kind: 'backtest' | 'sweep';
+  sweepId?: number | null;       // a backtest's own sweep, when it has one
   status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
   progress: number | null;
   error: string | null;

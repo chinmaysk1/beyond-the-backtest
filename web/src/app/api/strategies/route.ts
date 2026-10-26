@@ -10,9 +10,11 @@ export const dynamic = 'force-dynamic';
 
 /* The strategy library.
  *
- * Read from the `strategies` table, which the Python side fills from its JSON
+ * Read from the `strategies` table, which the Python side fills from its .pine
  * files (`python -m btb.engine library --sync`, also run on worker start).
- * The app never reads the backend's filesystem.
+ * The app never reads the backend's filesystem. The retired JSON library's
+ * rows stay in the table, so old tests still find their titles, but are not
+ * offered.
  *
  * Several versions of one strategy can exist -- editing a spec adds a row
  * rather than rewriting one, so old runs stay attached to the spec that made
@@ -24,9 +26,9 @@ export async function GET() {
   }
 
   const rows = await prisma.strategies.findMany({
-    where: { user_id: null },
+    where: { user_id: null, language: 'pine' },
     orderBy: { created_at: 'desc' },
-    select: { name: true, spec: true },
+    select: { name: true, spec: true, source: true },
   });
 
   const seen = new Set<string>();
@@ -34,7 +36,8 @@ export async function GET() {
   for (const r of rows) {
     if (seen.has(r.name)) continue;
     seen.add(r.name);
-    strategies.push(strategyInfo(r.name, r.spec as Record<string, any>));
+    strategies.push({ ...strategyInfo(r.name, r.spec as Record<string, any>), language: 'pine',
+                      source: r.source ?? undefined });
   }
   strategies.sort((a, b) => a.title.localeCompare(b.title));
   return NextResponse.json({ strategies });

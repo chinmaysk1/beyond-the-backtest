@@ -45,6 +45,9 @@ export function strategyInfo(name: string, s: Record<string, any>): StrategyInfo
     timeframes: s.timeframes ?? [],
     defaults: s.defaults ?? {},
     labels: s.labels ?? {},
-    combos: comboCount(s.grid ?? {}, s.defaults ?? {}, s.constraints ?? []),
+    // A Pine row carries the count its checker computed; the retired JSON
+    // spec is counted here.
+    combos: typeof s.combinations === 'number' ? s.combinations
+      : comboCount(s.grid ?? {}, s.defaults ?? {}, s.constraints ?? []),
   };
 }

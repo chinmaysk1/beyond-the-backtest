@@ -200,8 +200,9 @@ function Card({ t, onOpen }: { t: TestSummary; onOpen: (t: Opened) => void }) {
             onClick={() => onOpen({ id: t.id, sweepId: t.sweepId })}>
       <div className="rv-ctop">
         <div className="rv-cname"><b>{t.strategy.replace(/_/g, ' ')}</b><small>{meta}</small></div>
-        <ScoreRing score={t.score} band={t.band}
-                   title={t.scoring ? 'Scoring…' : t.score == null ? 'No score: the sweep failed, or it ran before scoring existed' : undefined} />
+        <ScoreRing score={t.score} band={t.band} unscored={t.unscored}
+                   title={t.unscored ? 'Not scored: the script has no // @grid lines, so one setting ran'
+                     : t.scoring ? 'Scoring…' : t.score == null ? 'No score: the sweep failed, or it ran before scoring existed' : undefined} />
       </div>
       {t.score == null && t.scoring ? (
         <div className="rv-pnl"><span className="rv-vs">Scoring {t.combos ? `${t.combos} settings` : 'every setting'}…</span></div>
@@ -215,6 +216,14 @@ function Card({ t, onOpen }: { t: TestSummary; onOpen: (t: Opened) => void }) {
         </div>
       )}
       {settings && <div className="rv-params">{settings}</div>}
+      {(t.unscored || t.zeroCosts || t.legacy || t.via) && (
+        <div className="rv-tags">
+          {t.unscored && <span className="rv-tag">Unscored · no @grid</span>}
+          {t.zeroCosts && <span className="rv-tag warn" title="The script sets commission and slippage to 0">Zero costs</span>}
+          {t.legacy && <span className="rv-tag" title="Made with the retired JSON strategy format">Legacy JSON · read-only</span>}
+          {t.via === 'mcp' && <span className="rv-tag">via your AI</span>}
+        </div>
+      )}
     </button>
   );
 }

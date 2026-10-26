@@ -80,6 +80,23 @@ export default function Dashboard({ username }: { username: string }) {
   // Warm the strategy library while the landing is up (see loadLibrary).
   useEffect(() => { loadLibrary().catch(() => {}); }, []);
 
+  // A link to one test (?test=ID, as the MCP tools return): skip the landing
+  // and open it in Results. The query is dropped so a reload starts normally.
+  useEffect(() => {
+    const id = Number(new URLSearchParams(window.location.search).get('test'));
+    if (!Number.isSafeInteger(id) || id < 1) return;
+    window.history.replaceState(null, '', window.location.pathname);
+    fetch(`/api/backtests/${id}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((job: { kind?: string; sweepId?: number | null } | null) => {
+        if (job?.kind !== 'backtest') return;
+        setOpened({ id, sweepId: job.sweepId ?? null });
+        setTab('results');
+        setStage('app');
+      })
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !(e.target as HTMLElement).matches('input, textarea, select')) home();

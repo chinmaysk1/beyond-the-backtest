@@ -198,6 +198,58 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS config jsonb NOT NULL DEFAULT '{}'::js
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS trades jsonb;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS equity jsonb;
 
+-- ---------------------------------------------------------------------------
+-- Pine strategies (Weeks 7–8). Additive, like the block above.
+-- ---------------------------------------------------------------------------
+
+-- A strategy is Pine source now. `spec` stays NOT NULL: for a Pine row it holds
+-- the description the pages read (title, style, labels, grid), never code, and
+-- legacy JSON rows keep their spec. `source_sha` is over the normalised source
+-- (line endings, trailing space), so one script pasted twice is one row.
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS language   text NOT NULL DEFAULT 'json';
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS source     text;
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS source_sha text;
+CREATE INDEX IF NOT EXISTS strategies_source_sha ON strategies (user_id, source_sha);
+
+-- What the user's own AI uses to act on their account (the MCP server).
+-- Tokens and codes are stored as sha256, never as issued: a leaked table
+-- grants nothing. OAuth clients register themselves (RFC 7591), which is how
+-- Claude.ai and ChatGPT connectors attach without a manual step.
+CREATE TABLE IF NOT EXISTS oauth_clients (
+    client_id     text PRIMARY KEY,
+    name          text,
+    redirect_uris text[] NOT NULL,
+    created_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS oauth_codes (
+    code_hash      text PRIMARY KEY,
+    client_id      text NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
+    user_id        uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    redirect_uri   text NOT NULL,
+    code_challenge text NOT NULL,             -- PKCE S256, required
+    scope          text NOT NULL,
+    expires_at     timestamptz NOT NULL,
+    used_at        timestamptz
+);
+
+-- One table for every bearer token: OAuth access and refresh tokens, and the
+-- personal access tokens a user creates for Claude Code.
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id           uuid PRIMARY KEY,
+    user_id      uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash   text NOT NULL UNIQUE,
+    kind         text NOT NULL CHECK (kind IN ('access', 'refresh', 'personal')),
+    client_id    text REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
+    name         text,
+    scope        text NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    last_used_at timestamptz,
+    expires_at   timestamptz,
+    revoked_at   timestamptz
+);
+CREATE INDEX IF NOT EXISTS api_tokens_user ON api_tokens (user_id, kind);
+
 -- Resuming a sweep depends on recognising work already done. Without this, an
 -- interrupted sweep silently re-runs everything it already has.
 --

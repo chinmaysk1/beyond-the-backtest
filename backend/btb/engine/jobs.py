@@ -1,6 +1,6 @@
 """What the worker does with a job: load the series, run, record.
 
-Two job kinds, both payloads validated here rather than trusted from the web
+Three job kinds, every payload validated here rather than trusted from the web
 app -- the app checks what it can, but this is the side that spends the CPU:
 
     backtest  {"strategy", "symbol", "timeframe", "params"?, "costs"?, "fill"?,
@@ -12,10 +12,18 @@ app -- the app checks what it can, but this is the side that spends the CPU:
               Every grid combination on train and on test. Ranked on TEST.
               Ends with the verdict (btb.verdict), always on the default windows.
 
+    check     {"source"}
+              A Pine script checked (btb.pine.check): errors, warnings, inputs,
+              grid, costs. Nothing runs. The web app's check button and the MCP
+              check_pine tool are answered from this.
+
 `windows` moves train and test: {"train": [start, end], "test": [start, end]}
 in unix seconds (see windows.custom). Omitted, the default split is used.
 
 Neither touches the holdout, and no `windows` can make them.
+
+Strategies are Pine (btb.pine). A strategy row in the retired JSON format can
+still be opened -- its stored results are untouched -- but not run again.
 """
 from __future__ import annotations
 
@@ -93,13 +101,34 @@ def parse_costs(raw: dict | None, asset_class: str) -> Costs:
     return Costs(c, s)
 
 
-def _strategy(conn, payload: dict, user_id: str | None = None) -> dict:
-    """The spec a job runs: a library strategy by name, or a user's own by id.
+# Checked and transpiled scripts, by source sha. Compiled libraries are cached
+# on disk by native.compile; this saves re-transpiling on every job.
+_PROGRAMS: dict = {}
 
-    A custom spec arrives from the web app, which checks what it can in the
-    browser. This is where it is actually validated -- the engine is the only
-    authority on the language -- and where ownership is enforced: a job may
-    run the library or its own user's strategies, nobody else's.
+
+def program_for(source: str, sha: str | None = None):
+    from ..pine.program import PineError, Program
+    key = sha or source
+    prog = _PROGRAMS.get(key)
+    if prog is None:
+        try:
+            prog = Program.from_source(source)
+        except PineError as e:
+            raise JobError("the strategy has problems: " + str(e)) from None
+        if len(_PROGRAMS) > 64:
+            _PROGRAMS.clear()
+        _PROGRAMS[key] = prog
+    return prog
+
+
+def _strategy(conn, payload: dict, user_id: str | None = None) -> dict:
+    """The strategy a job runs: a library strategy by name, or a user's own by
+    id, with its checked `program`.
+
+    A script arrives from the web app or the MCP server. This is where it is
+    actually checked -- the engine is the only authority on what runs -- and
+    where ownership is enforced: a job may run the library or its own user's
+    strategies, nobody else's.
     """
     sid = payload.get("strategy_id")
     if sid:
@@ -111,11 +140,22 @@ def _strategy(conn, payload: dict, user_id: str | None = None) -> dict:
         row = db.latest_strategy(conn, str(name or ""))
         if not row:
             raise JobError(f"unknown strategy {name!r}")
-    errs = S.validate(row["spec"])
-    if errs:
-        raise JobError("the strategy has problems: " + "; ".join(errs[:4])
-                       + (f" (+{len(errs) - 4} more)" if len(errs) > 4 else ""))
+    if row.get("language") != "pine":
+        raise JobError("this test was made with the retired JSON strategy format; its "
+                       "results stay readable, but it cannot be run again")
+    row["program"] = program_for(row["source"], row["source_sha"])
     return row
+
+
+def _feeds(conn, prog, series: B.Series) -> list[dict]:
+    """The other markets the script reads, loaded as symbol feeds -- each bounded
+    by its own newest complete bar, like the chart series."""
+    from ..pine.program import feed_of
+    out = []
+    for f in prog.feeds:
+        other = load_series(conn, f["symbol"], f["timeframe"])
+        out.append(feed_of(f, other))
+    return out
 
 
 def _fill(payload: dict) -> str:
@@ -148,19 +188,20 @@ def summary(m: dict) -> dict:
 
 def backtest_job(conn, payload: dict, *, job_id: int | None = None,
                  user_id: str | None = None) -> dict:
+    from ..pine.program import PineError, run_windows
     t0 = time.perf_counter()
     strat = _strategy(conn, payload, user_id)
-    spec = strat["spec"]
+    prog = strat["program"]
     try:
-        params = S.resolve_params(spec, payload.get("params") or {})
-    except S.SpecError as e:
+        params = prog.resolve_params(payload.get("params") or {})
+    except PineError as e:
         raise JobError(str(e)) from None
 
     series = load_series(conn, payload.get("symbol"), payload.get("timeframe"),
                          payload.get("adjust"))
+    # The script's own costs if it sets any; these defaults only if it does not.
     costs = parse_costs(payload.get("costs"), series.asset_class)
-    fill = _fill(payload)
-    cfg = B.config(costs, fill=fill, adjust=series.adjust)
+    cfg = prog.config(costs, series.adjust)
     split = _split(payload, series)
 
     # Train, test, both, and the holdout: each a fresh run with its own metrics.
@@ -182,10 +223,13 @@ def backtest_job(conn, payload: dict, *, job_id: int | None = None,
         wins.insert(3, split.holdout)
     if extend is not None:
         wins = [w for w in wins if w.name in ("holdout", "all")]
-    for w in wins:
+    try:
+        results = run_windows(prog, series, costs, params, [(w.start, w.end) for w in wins],
+                              [w.name == "all" for w in wins], feeds=_feeds(conn, prog, series))
+    except Exception as e:                      # sandbox / native failures, shown to the user
+        raise JobError(str(e)) from None
+    for w, r in zip(wins, results):
         drawn = w.name == "all"
-        r = B.run(spec, params, series, window=(w.start, w.end), costs=costs,
-                  fill=fill, with_curve=drawn)
         rid, _ = db.insert_run(
             conn, job_id=job_id, strategy_id=strat["id"], symbol=series.symbol,
             timeframe=series.timeframe, params=r.params, window_start=r.window[0],
@@ -200,6 +244,7 @@ def backtest_job(conn, payload: dict, *, job_id: int | None = None,
     conn.commit()
     return {
         "strategy": strat["name"], "spec_sha": strat["spec_sha"],
+        "language": "pine", "source_sha": strat["source_sha"], "scored": prog.scored,
         "symbol": series.symbol, "timeframe": series.timeframe,
         "as_of": series.as_of, "adjust": series.adjust,
         "params": params, "config": cfg, **_windows_out(split, series),
@@ -269,6 +314,13 @@ def sweep_series(spec: dict, series: B.Series, costs: Costs, *, fill: str = "clo
                 progress(k, total)
         rows.append(row)
 
+    return _ranked(rows, combos=len(combos), raw_grid=raw, evaluated=total, reused=reused,
+                   windows=split.as_dict())
+
+
+def _ranked(rows: list[dict], **head) -> dict:
+    """Rank every row on train and on test, and lay the result out as the
+    pages read it. Shared by the JSON sweep and the Pine sweep."""
     def key(split_name):
         # Ruined runs sink to the bottom whatever their return says.
         return lambda r: (not r[split_name]["ruin"], r[split_name]["net_pct"] or -1e18)
@@ -279,8 +331,7 @@ def sweep_series(spec: dict, series: B.Series, costs: Costs, *, fill: str = "clo
     for rank, r in enumerate(ranked, 1):
         r["test_rank"] = rank
     return {
-        "combos": len(combos), "raw_grid": raw, "evaluated": total, "reused": reused,
-        "ranked_on": "test", "windows": split.as_dict(),
+        **head, "ranked_on": "test",
         "top": ranked[:10],
         # Every combination, test-ranked, for the test page's full table.
         "rows": ranked,
@@ -294,68 +345,109 @@ def sweep_series(spec: dict, series: B.Series, costs: Costs, *, fill: str = "clo
     }
 
 
+def pine_sweep_series(prog, series: B.Series, costs: Costs, *, split: W.Split | None = None,
+                      progress: Callable[[int, int], None] | None = None,
+                      feeds: list[dict] | None = None) -> dict:
+    """The Pine sweep: every grid combination once over train + test (see
+    btb.pine.program.sweep), ranked on test. Same shape as sweep_series'
+    result, plus `matrix`, the verdict's returns from the same runs, and
+    `_window_bounds` / per-row `_metrics` for recording, which the caller
+    removes."""
+    from ..pine.program import sweep
+    split = split or W.split(series.ts)
+    if not prog.grid.combos:
+        raise JobError("the grid is empty after constraints")
+    try:
+        if prog.feeds and feeds is None:
+            raise JobError("this script reads other markets, which need the database")
+        raw = sweep(prog, series, costs, split, progress=progress, feeds=feeds)
+    except Exception as e:
+        raise JobError(str(e)) from None
+    rows = [{"params": r["params"], "train": summary(r["train"]), "test": summary(r["test"]),
+             "_metrics": (r["train"], r["test"])} for r in raw["rows"]]
+    out = _ranked(rows, combos=len(rows), raw_grid=prog.grid.raw, evaluated=len(rows),
+                  reused=0, windows=split.as_dict(), runs_per_combination=1)
+    out["matrix"] = raw["matrix"]
+    out["_window_bounds"] = raw["windows"]
+    return out
+
+
 def sweep_job(conn, payload: dict, *, job_id: int | None = None,
               user_id: str | None = None) -> dict:
     t0 = time.perf_counter()
     strat = _strategy(conn, payload, user_id)
-    spec = strat["spec"]
+    prog = strat["program"]
     series = load_series(conn, payload.get("symbol"), payload.get("timeframe"),
                          payload.get("adjust"))
     costs = parse_costs(payload.get("costs"), series.asset_class)
-    fill = _fill(payload)
-    cfg = B.config(costs, fill=fill, adjust=series.adjust)
+    cfg = prog.config(costs, series.adjust)
     split = _split(payload, series)
+    head = {"strategy": strat["name"], "spec_sha": strat["spec_sha"], "language": "pine",
+            "source_sha": strat["source_sha"], "symbol": series.symbol,
+            "timeframe": series.timeframe, "as_of": series.as_of, "adjust": series.adjust,
+            "config": cfg, **_windows_out(split, series)}
+    if not prog.scored:
+        # No // @grid lines: the backtest job ran the one setting there is.
+        # There is nothing to rank and nothing to score.
+        return {**head, "scored": False, "combos": 1, "top": [], "rows": [], "ranks": [],
+                "reason": "No // @grid lines, so only the default settings ran. Add @grid "
+                          "lines to sweep and score it.",
+                "seconds": round(time.perf_counter() - t0, 2)}
+
     key = dict(strategy_id=strat["id"], symbol=series.symbol, timeframe=series.timeframe)
-    pending: list[dict] = []
     last = [time.perf_counter()]
 
-    def recorded(sp: W.Split):
-        # Boundaries are snapped to real bars, default or moved, so these are
-        # exactly the windows a run records -- which is what lets a restarted
-        # sweep recognise its work, and a sweep over the same moved windows
-        # reuse it.
-        existing = db.runs_for_windows(conn, config=cfg, windows={
-            w.name: (w.start, w.end) for w in (sp.train, sp.test)}, **key)
-        return lambda name, p: existing.get((name, json.dumps(p, sort_keys=True)))
-
-    def record(name, p, r):
-        pending.append(dict(job_id=job_id, params=r.params, window_start=r.window[0],
-                            window_end=r.window[1], as_of=series.as_of, split=name,
-                            metrics=r.metrics, config=cfg, **key))
-
-    def flush():
-        db.insert_runs(conn, pending)
-        pending.clear()
-        conn.commit()                  # recorded runs survive a crash
-
     def progress(k, total):
-        # Batched about once a second: often enough that a killed worker loses
-        # at most a second of work, rarely enough that the round trips to the
-        # database do not dominate a sweep that computes in milliseconds.
         now = time.perf_counter()
-        if now - last[0] > 1.0 or k == total:
-            flush()
-            if job_id is not None:
-                db.job_progress(conn, job_id, k / total)
+        if job_id is not None and (now - last[0] > 1.0 or k == total):
+            db.job_progress(conn, job_id, 0.98 * k / total)
+            conn.commit()
             last[0] = now
 
-    out = sweep_series(spec, series, costs, fill=fill, split=split, record=record,
-                       done=recorded(split), progress=progress)
-    conn.commit()
+    def record(res):
+        bounds = res.pop("_window_bounds")
+        db.insert_runs(conn, [
+            dict(job_id=job_id, params=r["params"], window_start=bounds[name][0],
+                 window_end=bounds[name][1], as_of=series.as_of, split=name,
+                 metrics=m, config=cfg, **key)
+            for r in res["rows"] for name, m in zip(("train", "test"), r.pop("_metrics"))])
+        conn.commit()
 
+    feeds = _feeds(conn, prog, series)
+    out = pine_sweep_series(prog, series, costs, split=split, progress=progress, feeds=feeds)
+    record(out)
     # The verdict is always scored on the DEFAULT windows: one that moved with
-    # dragged windows could be dragged until it looked good. Moved windows need
-    # the default ranking too; its runs are usually recorded already.
+    # dragged windows could be dragged until it looked good.
     base = W.split(series.ts)
-    ranked = out if split == base else sweep_series(
-        spec, series, costs, fill=fill, split=base, record=record, done=recorded(base))
-    flush()
-    out["verdict"] = V.evaluate(spec, series, costs, ranked, fill=fill, split=base)
-    out.update({"strategy": strat["name"], "spec_sha": strat["spec_sha"],
-                "symbol": series.symbol, "timeframe": series.timeframe,
-                "as_of": series.as_of, "adjust": series.adjust, "config": cfg,
-                **_windows_out(split, series),
-                "seconds": round(time.perf_counter() - t0, 2)})
+    ranked = out
+    if split != base:
+        ranked = pine_sweep_series(prog, series, costs, split=base, feeds=feeds)
+        record(ranked)
+    mx = ranked.pop("matrix")
+    out.pop("matrix", None)
+    out["verdict"] = V.evaluate(prog, series, costs, ranked, split=base, matrix=mx)
+    out.update({**head, "scored": True, "seconds": round(time.perf_counter() - t0, 2)})
+    return out
+
+
+def check_job(conn, payload: dict, *, job_id: int | None = None,
+              user_id: str | None = None) -> dict:
+    """A script checked, plus -- when it passes -- the name and the `spec`
+    description the web app stores with it, built exactly as the library's
+    are, so the pages read a pasted script and a library one the same way."""
+    import re
+    from ..pine.check import check
+    from ..pine.library import spec_of
+    source = payload.get("source")
+    if not isinstance(source, str):
+        raise JobError("check needs a 'source'")
+    r = check(source)
+    out = r.as_dict()
+    if r.ok:
+        name = re.sub(r"[^a-z0-9]+", "_", (r.title or "").lower()).strip("_")[:64]
+        name = name if re.match(r"^[a-z]", name) else f"pine_{name}" if name else "pine_strategy"
+        out["name"] = name
+        out["spec"] = spec_of(name, r)
     return out
 
 
@@ -367,4 +459,4 @@ def _spearman(a: list[int], b: list[int]) -> float | None:
     return round(1 - 6 * d2 / (n * (n * n - 1)), 4)
 
 
-HANDLERS = {"backtest": backtest_job, "sweep": sweep_job}
+HANDLERS = {"backtest": backtest_job, "sweep": sweep_job, "check": check_job}

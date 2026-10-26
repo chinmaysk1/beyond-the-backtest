@@ -1,0 +1,31 @@
+//@version=6
+// @description Follow Supertrend flips, but only in the direction of a long moving average.
+// @style trend
+// @timeframes 4h, 1d
+strategy("Supertrend with trend filter", overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+     process_orders_on_close=true)
+
+atr_len   = input.int(10, "ATR length", minval=1)
+mult      = input.float(3.0, "ATR multiplier", minval=0.1)
+trend_len = input.int(200, "Trend filter length", minval=1)
+// @grid atr_len   = 10, 14, 20
+// @grid mult      = 2, 3, 4
+// @grid trend_len = 100, 200
+
+[line, direction] = ta.supertrend(mult, atr_len)
+// Pine reports an uptrend as -1; flip it so up is +1.
+up_trend = -direction
+flip_up = ta.crossover(up_trend, 0)
+flip_dn = ta.crossunder(up_trend, 0)
+trend = ta.ema(close, trend_len)
+
+if strategy.position_size > 0 and flip_dn
+    strategy.close("Long")
+if strategy.position_size < 0 and flip_up
+    strategy.close("Short")
+if flip_up and close > trend
+    strategy.entry("Long", strategy.long)
+if flip_dn and close < trend
+    strategy.entry("Short", strategy.short)
