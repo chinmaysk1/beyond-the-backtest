@@ -15,7 +15,21 @@ Already running, and untouched by anything here:
 | n8n | 5678 |
 | quantlab-dash | 8088 |
 
-Ports 80 and 443 are free, which is where Caddy will go in Weeks 9–11.
+Ports 80 and 443 are free; Caddy takes them when the site goes public.
+
+What this project runs there:
+
+| Container | Does | Limits |
+|---|---|---|
+| `btb-postgres` | the database, on `127.0.0.1` and the `btb` network only | |
+| `btb-worker` | backtests and sweeps (Pine through PineForge), data refresh when idle | 2 cores, 4 GB |
+| `btb-checker` | answers Pine `check` jobs only, so a sweep never delays a check | 0.5 core, 512 MB |
+| `btb-web` | the Next.js app and the MCP server; reachable only through Caddy | 0.75 core, 1 GB |
+| `btb-caddy` | TLS for `BTB_DOMAIN`, the only public ports | |
+
+The worker has both cores because a Pine sweep splits across two sandboxed
+processes; open-webui can lag while a long 15m sweep runs, accepted for sweeps
+that finish in minutes rather than ten.
 
 ## Bringing it up
 
@@ -59,7 +73,21 @@ docker logs -f btb-worker          # on the box
 ```
 
 `up.sh` rebuilds the image, re-applies the schema (idempotent), and recreates
-`btb-worker`. The worker loads the strategy library into the database on start,
+`btb-worker` and `btb-checker`. With `BTB_DOMAIN` and `BTB_SESSION_SECRET` set
+it also builds and starts `btb-web` and `btb-caddy` (ship `web/` too, minus
+`node_modules` and `.next`):
+
+```bash
+BTB_DB_PASSWORD=... BTB_DOMAIN=btb.example.com BTB_SESSION_SECRET=... bash deploy/up.sh
+```
+
+Before that: point the domain's A record at the box, and open TCP 80 and 443 in
+the OCI security list and in iptables (see the firewall note). Caddy gets the
+certificate on its first start once both are true.
+
+The first sweep of a new script compiles it (4-7 s on this box); compiled
+strategies are kept in the `btb_pinecache` volume, so the same script never
+compiles twice, across restarts too. The worker loads the strategy library into the database on start,
 claims `backtest` and `sweep` jobs, and between jobs refreshes any series with a
 newly closed bar. A refresh gives way as soon as a job is queued, so a click in
 the web app never waits behind a data catch-up.

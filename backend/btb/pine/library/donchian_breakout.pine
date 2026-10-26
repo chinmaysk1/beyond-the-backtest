@@ -1,0 +1,29 @@
+//@version=6
+// @description Buy a break above the highest high of the last N bars; sell a break below the lowest low. Exit on a shorter opposite channel.
+// @style breakout
+// @timeframes 4h, 1d
+strategy("Donchian breakout", overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+     process_orders_on_close=true)
+
+len      = input.int(55, "Breakout channel length", minval=1)
+exit_len = input.int(20, "Exit channel length", minval=1)
+// @grid len      = 20, 55, 100
+// @grid exit_len = 10, 20, 50
+// @constraint exit_len < len
+
+// Channels end on the previous bar: a bar cannot break its own high.
+upper      = ta.highest(high, len)[1]
+lower      = ta.lowest(low, len)[1]
+exit_upper = ta.highest(high, exit_len)[1]
+exit_lower = ta.lowest(low, exit_len)[1]
+
+if strategy.position_size > 0 and close < exit_lower
+    strategy.close("Long")
+if strategy.position_size < 0 and close > exit_upper
+    strategy.close("Short")
+if close > upper
+    strategy.entry("Long", strategy.long)
+if close < lower
+    strategy.entry("Short", strategy.short)

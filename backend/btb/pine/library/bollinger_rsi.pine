@@ -1,0 +1,38 @@
+//@version=6
+// @description Buy when price closes below the lower band while RSI is oversold, sell the mirror image; exit at the middle band.
+// @style mean-reversion
+// @timeframes 1h, 4h, 1d
+strategy("Bollinger + RSI reversion", overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+     process_orders_on_close=true)
+
+len      = input.int(20, "Band length", minval=1)
+mult     = input.float(2.0, "Band width (standard deviations)", minval=0.1)
+rsi_len  = input.int(14, "RSI length", minval=1)
+rsi_low  = input.float(30, "Oversold level (overbought is 100 minus this)", minval=0, maxval=50)
+stop_pct = input.float(5, "Stop loss %", minval=0)
+// @grid len      = 20, 50
+// @grid mult     = 2, 2.5
+// @grid rsi_low  = 25, 30, 35
+// @grid stop_pct = 0, 5
+
+[mid, upper, lower] = ta.bb(close, len, mult)
+r = ta.rsi(close, rsi_len)
+
+if strategy.position_size > 0 and close >= mid
+    strategy.close("Long")
+if strategy.position_size < 0 and close <= mid
+    strategy.close("Short")
+if close < lower and r < rsi_low
+    strategy.entry("Long", strategy.long)
+    if stop_pct > 0
+        strategy.exit("Long stop", "Long", stop=close * (1 - stop_pct / 100))
+if close > upper and r > 100 - rsi_low
+    strategy.entry("Short", strategy.short)
+    if stop_pct > 0
+        strategy.exit("Short stop", "Short", stop=close * (1 + stop_pct / 100))
+if strategy.position_size > 0 and stop_pct > 0
+    strategy.exit("Long stop", "Long", stop=strategy.position_avg_price * (1 - stop_pct / 100))
+if strategy.position_size < 0 and stop_pct > 0
+    strategy.exit("Short stop", "Short", stop=strategy.position_avg_price * (1 + stop_pct / 100))

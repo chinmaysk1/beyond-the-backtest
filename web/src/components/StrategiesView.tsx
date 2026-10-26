@@ -3,44 +3,62 @@
 import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
-import { AI_PROMPT, EXAMPLE_SPEC, PROMPT_PLACEHOLDER, checkSpecText, type SpecCheck } from '../lib/specCheck';
 import { clamp, date } from '../lib/format';
 import { pollJob, submitJob } from '../lib/jobs';
+import { describeCosts, messageText, type PineCheck, type PineInput } from '../lib/pine';
+import { PINE_REFERENCE } from '../lib/pineReference';
 import type { Costs, CustomStrategyInfo, Job, Market, StrategyInfo } from '../lib/types';
+import ConnectAI from './ConnectAI';
 
 /* The Strategies tab, as one flow in two phases:
  *
  *   compose   one question, centred: which market, which timeframe, which
- *             strategy (from the library, or your own JSON), at what cost
+ *             strategy (from the library, your own Pine, or written by your own
+ *             AI over MCP), at what cost
  *   running   the backtest and its sweep, live from the worker
  *
  * Then the test opens in the Results tab (TestView), where every test lives:
- * the return on data it never saw, the verdict, the curve, every setting the
+ * the return on data it never saw, the score, the curve, every setting the
  * sweep tried and how much to trust the best one.
  *
  * "Run backtest" always queues the sweep too. Finding the best settings is not
  * a separate decision the user has to know to make -- and a best-settings list
  * without the train/test comparison beside it is exactly the misleading
- * number this product exists to replace.
+ * number this product exists to replace. A script with no // @grid lines has
+ * nothing to sweep: it runs once and its card says it is unscored.
  */
 
 type Phase = 'compose' | 'running';
+type Source = 'lib' | 'pine' | 'ai';
 
 const ALL_TF = ['5m', '15m', '30m', '1h', '4h', '1d'];
-// Mirrors btb/engine/fills.py DEFAULT_COSTS. The form starts here; the engine
-// applies its own defaults if none are sent.
+// Mirrors btb/engine/fills.py DEFAULT_COSTS. These are what a script that sets
+// no costs of its own is charged; a script that sets any is charged its own.
 const DEFAULT_COSTS: Record<string, Costs> = {
   crypto: { commission_pct: 0.1, slippage_bps: 5 },
   equity: { commission_pct: 0, slippage_bps: 2 },
 };
 const MIN_RUN_MS = 2200;      // long enough to read what happened, never padded past that
+const CHECK_DELAY_MS = 700;   // after the last keystroke
+
+export const EXAMPLE_PINE = PINE_REFERENCE.split('## 6. A complete example')[1]
+  ?.split('```pine')[1]?.split('```')[0]?.trim() ?? '';
+export const PROMPT_PLACEHOLDER = 'describe your idea in plain English here';
+export const AI_PROMPT = `${PINE_REFERENCE}
+
+---
+
+Write a strategy for Beyond the Backtest that follows every rule above. Reply with the
+Pine script only, in one code block.
+
+My idea: `;
 
 export type Opened = { id: number; sweepId: number | null };
 
 /* What was last composed, so coming back from a test's page to run another
  * starts where the last one left off. Module state: it outlives the tab. */
-let last: { symbol: string | null; timeframe: string; source: 'lib' | 'json'; strategy: string;
-            jsonText: string; costs: Costs } | null = null;
+let last: { symbol: string | null; timeframe: string; source: Source; strategy: string;
+            pineText: string; costs: Costs } | null = null;
 
 export default function StrategiesView({ markets, onDone }: { markets: Market[]; onDone: (t: Opened) => void }) {
   const router = useRouter();
@@ -48,11 +66,12 @@ export default function StrategiesView({ markets, onDone }: { markets: Market[];
   const [custom, setCustom] = useState<CustomStrategyInfo[]>([]);
   const [symbol, setSymbol] = useState<string | null>(last?.symbol ?? null);
   const [timeframe, setTimeframe] = useState(last?.timeframe ?? '4h');
-  const [source, setSource] = useState<'lib' | 'json'>(last?.source ?? 'lib');
+  const [source, setSource] = useState<Source>(last?.source === 'ai' ? 'lib' : last?.source ?? 'lib');
   const [strategy, setStrategy] = useState(last?.strategy ?? 'ema_cross_adx');
-  const [jsonText, setJsonText] = useState(last?.jsonText ?? '');
+  const [pineText, setPineText] = useState(last?.pineText ?? '');
   const [costs, setCosts] = useState<Costs>(last?.costs ?? DEFAULT_COSTS.crypto);
   const [costsOpen, setCostsOpen] = useState(false);
+  const check = usePineCheck(source === 'pine' ? pineText : '');
 
   const [phase, setPhase] = useState<Phase>('compose');
   const [bt, setBt] = useState<Job | null>(null);
@@ -68,14 +87,16 @@ export default function StrategiesView({ markets, onDone }: { markets: Market[];
   }, []);
 
   useEffect(() => {
-    last = { symbol, timeframe, source, strategy, jsonText, costs };
-  }, [symbol, timeframe, source, strategy, jsonText, costs]);
+    last = { symbol, timeframe, source, strategy, pineText, costs };
+  }, [symbol, timeframe, source, strategy, pineText, costs]);
 
   const market = useMemo(() => markets.find((m) => m.symbol === symbol) ?? null, [markets, symbol]);
   const spec = strategies.find((s) => s.name === strategy) ?? null;
-  const check: SpecCheck | null = useMemo(() => (jsonText.trim() ? checkSpecText(jsonText) : null), [jsonText]);
-  const combos = source === 'lib' ? spec?.combos ?? 0 : check?.ok ? check.combos : 0;
-  const canRun = !!symbol && (source === 'lib' ? !!spec : !!check?.ok);
+  const ok = check.result?.ok === true;
+  const combos = source === 'lib' ? spec?.combos ?? 0 : ok ? check.result!.grid.combinations : 0;
+  const scored = source === 'lib' ? combos > 0 : ok && check.result!.scored;
+  const scriptCosts = source === 'pine' && ok && check.result!.costs.set ? check.result!.costs : null;
+  const canRun = !!symbol && (source === 'lib' ? !!spec : source === 'pine' && ok && !check.busy);
 
   /* -- load ---------------------------------------------------------------- */
 
@@ -89,8 +110,8 @@ export default function StrategiesView({ markets, onDone }: { markets: Market[];
     refreshCustom();
   }, [router]);
 
-  // Past JSON strategies change whenever one runs, so unlike the library this
-  // is fetched fresh each time. Not having them is not worth an error.
+  // Past scripts change whenever one runs, so unlike the library this is
+  // fetched fresh each time. Not having them is not worth an error.
   function refreshCustom() {
     fetch('/api/strategies/custom')
       .then((res) => (res.ok ? res.json() : null))
@@ -98,11 +119,12 @@ export default function StrategiesView({ markets, onDone }: { markets: Market[];
       .catch(() => {});
   }
 
-  // A past spec goes back through the JSON box, so it is checked and run
-  // exactly as if it had just been pasted.
-  const pickCustom = useCallback((c: CustomStrategyInfo) => {
-    setJsonText(JSON.stringify(c.spec, null, 2));
-    setSource('json');
+  // A past script, or a library one to edit, goes back through the Pine box,
+  // so it is checked and run exactly as if it had just been pasted.
+  const editPine = useCallback((text: string | undefined) => {
+    if (!text) return;
+    setPineText(text);
+    setSource('pine');
   }, []);
 
   const pickMarket = useCallback((m: Market) => {
@@ -128,7 +150,7 @@ export default function StrategiesView({ markets, onDone }: { markets: Market[];
     setSw(null);
     const started = performance.now();
     const body: Record<string, unknown> = { kind: 'backtest', withSweep: true, symbol, timeframe, costs };
-    if (source === 'json' && check?.ok) body.spec = check.spec;
+    if (source === 'pine') body.source = pineText;
     else body.strategy = strategy;
     let ids;
     try {
@@ -138,7 +160,7 @@ export default function StrategiesView({ markets, onDone }: { markets: Market[];
       return;
     }
     setPhase('running');
-    if (source === 'json') refreshCustom();
+    if (source === 'pine') refreshCustom();
     const live = () => alive.current;
     try {
       const [b] = await Promise.all([pollJob(ids.id, setBt, live), ids.sweepId ? pollJob(ids.sweepId, setSw, live) : null]);
@@ -165,16 +187,17 @@ export default function StrategiesView({ markets, onDone }: { markets: Market[];
           timeframe={timeframe} setTimeframe={setTimeframe}
           source={source} setSource={setSource}
           strategies={strategies} strategy={strategy} setStrategy={setStrategy}
-          custom={custom} pickCustom={pickCustom}
-          jsonText={jsonText} setJsonText={setJsonText} check={check}
+          custom={custom} editPine={editPine}
+          pineText={pineText} setPineText={setPineText} check={check}
           costs={costs} setCosts={setCosts} costsOpen={costsOpen} setCostsOpen={setCostsOpen}
-          combos={combos} canRun={canRun} onRun={run} error={error}
+          scriptCosts={scriptCosts}
+          combos={combos} scored={scored} canRun={canRun} onRun={run} error={error}
         />
       </div>
 
       <div className={`sv-phase ${phase === 'running' ? 'on' : ''}`}>
         {phase === 'running' && (
-          <Running market={market} timeframe={timeframe} bt={bt} sw={sw} combos={combos} />
+          <Running market={market} timeframe={timeframe} bt={bt} sw={sw} combos={combos} scored={scored} />
         )}
       </div>
     </div>
@@ -195,17 +218,48 @@ export function loadLibrary(): Promise<StrategyInfo[]> {
   return libraryRequest;
 }
 
+/* Check the script CHECK_DELAY_MS after the last keystroke. The checker is the
+ * engine's own (btb/pine/check.py, through a check job), so what this panel
+ * says is exactly what a run will be held to. A newer keystroke wins: an
+ * answer for text that has since changed is dropped. */
+type CheckState = { result: PineCheck | null; busy: boolean; error: string | null };
+function usePineCheck(text: string): CheckState {
+  const [state, setState] = useState<CheckState>({ result: null, busy: false, error: null });
+  const latest = useRef('');
+  useEffect(() => {
+    latest.current = text;
+    if (!text.trim()) { setState({ result: null, busy: false, error: null }); return; }
+    setState((s) => ({ ...s, busy: true }));
+    const t = setTimeout(async () => {
+      try {
+        const res = await fetch('/api/pine/check', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source: text }),
+        });
+        const out = await res.json();
+        if (latest.current !== text) return;
+        if (!res.ok) setState({ result: null, busy: false, error: out.error ?? 'Could not check the script' });
+        else setState({ result: out as PineCheck, busy: false, error: null });
+      } catch {
+        if (latest.current === text) setState({ result: null, busy: false, error: 'Could not reach the checker' });
+      }
+    }, CHECK_DELAY_MS);
+    return () => clearTimeout(t);
+  }, [text]);
+  return state;
+}
+
 /* ============================================================ compose */
 
 type ComposeProps = {
   markets: Market[]; market: Market | null; pickMarket: (m: Market) => void;
   timeframe: string; setTimeframe: (t: string) => void;
-  source: 'lib' | 'json'; setSource: (s: 'lib' | 'json') => void;
+  source: Source; setSource: (s: Source) => void;
   strategies: StrategyInfo[]; strategy: string; setStrategy: (s: string) => void;
-  custom: CustomStrategyInfo[]; pickCustom: (c: CustomStrategyInfo) => void;
-  jsonText: string; setJsonText: (s: string) => void; check: SpecCheck | null;
+  custom: CustomStrategyInfo[]; editPine: (text: string | undefined) => void;
+  pineText: string; setPineText: (s: string) => void; check: CheckState;
   costs: Costs; setCosts: (c: Costs) => void; costsOpen: boolean; setCostsOpen: (b: boolean) => void;
-  combos: number; canRun: boolean; onRun: () => void; error: string | null;
+  scriptCosts: PineCheck['costs'] | null;
+  combos: number; scored: boolean; canRun: boolean; onRun: () => void; error: string | null;
 };
 
 function Compose(p: ComposeProps) {
@@ -216,7 +270,7 @@ function Compose(p: ComposeProps) {
 
   return (
     <div className="sv-compose">
-      <div className="sv-composer">
+      <div className={`sv-composer ${p.source === 'pine' ? 'wide' : ''}`}>
         <div className="sv-kick">New backtest</div>
         <h2 className="sv-q">What do you want to test?</h2>
         <div className="sv-body">
@@ -246,48 +300,63 @@ function Compose(p: ComposeProps) {
           <div className="sv-field">
             <label>Strategy</label>
             <div>
-              <Seg value={p.source} onChange={(v) => p.setSource(v as 'lib' | 'json')}
-                   options={[{ id: 'lib', label: 'Library' }, { id: 'json', label: 'Custom JSON' }]} />
-              {p.source === 'lib'
-                ? <Library strategies={p.strategies} custom={p.custom} value={p.strategy} onChange={p.setStrategy} onCustom={p.pickCustom} />
-                : <CustomJson text={p.jsonText} setText={p.setJsonText} check={p.check} />}
+              <Seg value={p.source} onChange={(v) => p.setSource(v as Source)}
+                   options={[{ id: 'lib', label: 'Library' }, { id: 'pine', label: 'Your Pine' },
+                             { id: 'ai', label: 'Connect your AI' }]} />
+              {p.source === 'lib' && <Library strategies={p.strategies} custom={p.custom} value={p.strategy}
+                                              onChange={p.setStrategy} onEdit={p.editPine} />}
+              {p.source === 'pine' && <PineEditor text={p.pineText} setText={p.setPineText} check={p.check} />}
+              {p.source === 'ai' && <ConnectAI prompt={AI_PROMPT} placeholder={PROMPT_PLACEHOLDER} />}
             </div>
           </div>
 
-          <div className="sv-field">
-            <label>Costs</label>
-            <div>
-              <div className="sv-costs">
-                <span><span className="mono">{p.costs.commission_pct.toFixed(2)}%</span> commission
-                  + <span className="mono">{p.costs.slippage_bps} bps</span> slippage per trade</span>
-                <button type="button" className="sv-link" onClick={() => p.setCostsOpen(!p.costsOpen)}>
-                  {p.costsOpen ? 'done' : 'edit'}
-                </button>
+          {p.source !== 'ai' && <>
+            <div className="sv-field">
+              <label>Costs</label>
+              <div>
+                {p.scriptCosts ? (
+                  <div className="sv-costs">
+                    <span>{describeCosts(p.scriptCosts)}</span>
+                    {p.scriptCosts.zero && <span className="sv-warn-chip">optimistic: real fills cost more</span>}
+                  </div>
+                ) : <>
+                  <div className="sv-costs">
+                    <span><span className="mono">{p.costs.commission_pct.toFixed(2)}%</span> commission
+                      + <span className="mono">{p.costs.slippage_bps} bps</span> slippage per trade</span>
+                    <button type="button" className="sv-link" onClick={() => p.setCostsOpen(!p.costsOpen)}>
+                      {p.costsOpen ? 'done' : 'edit'}
+                    </button>
+                  </div>
+                  {p.costsOpen && (
+                    <div className="sv-costs-edit">
+                      <label className="sv-num">
+                        <input type="number" step="0.01" min="0" max="2" value={p.costs.commission_pct}
+                               onChange={(e) => p.setCosts({ ...p.costs, commission_pct: clamp(Number(e.target.value) || 0, 0, 2) })} />
+                        <span>% fee</span>
+                      </label>
+                      <label className="sv-num">
+                        <input type="number" step="1" min="0" max="200" value={p.costs.slippage_bps}
+                               onChange={(e) => p.setCosts({ ...p.costs, slippage_bps: clamp(Number(e.target.value) || 0, 0, 200) })} />
+                        <span>bps slip</span>
+                      </label>
+                    </div>
+                  )}
+                  <div className="sv-note">Charged when the script sets no costs of its own.</div>
+                </>}
               </div>
-              {p.costsOpen && (
-                <div className="sv-costs-edit">
-                  <label className="sv-num">
-                    <input type="number" step="0.01" min="0" max="2" value={p.costs.commission_pct}
-                           onChange={(e) => p.setCosts({ ...p.costs, commission_pct: clamp(Number(e.target.value) || 0, 0, 2) })} />
-                    <span>% fee</span>
-                  </label>
-                  <label className="sv-num">
-                    <input type="number" step="1" min="0" max="200" value={p.costs.slippage_bps}
-                           onChange={(e) => p.setCosts({ ...p.costs, slippage_bps: clamp(Number(e.target.value) || 0, 0, 200) })} />
-                    <span>bps slip</span>
-                  </label>
-                </div>
-              )}
             </div>
-          </div>
 
-          <button type="button" className="sv-run" disabled={!p.canRun} onClick={p.onRun}>Run backtest</button>
-          <div className="sv-run-sub">
-            {p.canRun
-              ? <>Runs the chosen settings, then tries all <b>{p.combos}</b> combinations and ranks them on data they never saw.</>
-              : p.source === 'json' ? 'Paste a valid strategy to continue.' : 'Choose a market and a strategy.'}
-          </div>
-          {p.error && <div className="sv-error">{p.error}</div>}
+            <button type="button" className="sv-run" disabled={!p.canRun} onClick={p.onRun}>Run backtest</button>
+            <div className="sv-run-sub">
+              {p.canRun
+                ? p.scored
+                  ? <>Runs the chosen settings, then tries all <b>{p.combos}</b> combinations and ranks them on data they never saw.</>
+                  : <>Runs the script once on its defaults. With no <span className="mono">// @grid</span> lines there is nothing to sweep, so it won’t be scored.</>
+                : p.source === 'pine' ? (p.check.busy ? 'Checking…' : 'Paste a script that checks out to continue.')
+                  : 'Choose a market and a strategy.'}
+            </div>
+            {p.error && <div className="sv-error">{p.error}</div>}
+          </>}
         </div>
       </div>
     </div>
@@ -363,12 +432,13 @@ function Seg({ value, options, onChange }: { value: string; options: SegOpt[]; o
 
 type LibraryProps = {
   strategies: StrategyInfo[]; custom: CustomStrategyInfo[];
-  value: string; onChange: (s: string) => void; onCustom: (c: CustomStrategyInfo) => void;
+  value: string; onChange: (s: string) => void; onEdit: (text: string | undefined) => void;
 };
 
-/* The library, then the user's own past JSON strategies under it. One search
- * box filters both. Picking a past one opens it in Custom JSON to run again. */
-function Library({ strategies, custom, value, onChange, onCustom }: LibraryProps) {
+/* The library, then the user's own past scripts under it. One search box
+ * filters both. Picking a past one opens it in Your Pine to run again; a
+ * library one can be opened there to edit. */
+function Library({ strategies, custom, value, onChange, onEdit }: LibraryProps) {
   const [q, setQ] = useState('');
   if (!strategies.length) return <div className="sv-note" style={{ marginTop: 12 }}>Loading the library…</div>;
   const needle = q.trim().toLowerCase();
@@ -380,7 +450,7 @@ function Library({ strategies, custom, value, onChange, onCustom }: LibraryProps
       <input className="sv-lib-search" value={q} onChange={(e) => setQ(e.target.value)}
              placeholder={`Search ${strategies.length + custom.length} strategies`}
              onKeyDown={(e) => {
-               if (e.key === 'Enter') { if (lib[0]) onChange(lib[0].name); else if (mine[0]) onCustom(mine[0]); }
+               if (e.key === 'Enter') { if (lib[0]) onChange(lib[0].name); else if (mine[0]) onEdit(mine[0].source); }
                if (e.key === 'Escape') setQ('');
              }} />
       {!lib.length && !mine.length && <div className="sv-note">Nothing matches “{q.trim()}”.</div>}
@@ -391,55 +461,105 @@ function Library({ strategies, custom, value, onChange, onCustom }: LibraryProps
           <span>
             <b>{s.title}</b>
             <span className="sv-desc"><span>{s.description}</span></span>
+            {s.name === value && s.source && (
+              <span className="sv-link sv-edit" role="button" tabIndex={0}
+                    onClick={(e) => { e.stopPropagation(); onEdit(s.source); }}
+                    onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); onEdit(s.source); } }}>
+                Edit as Pine
+              </span>
+            )}
           </span>
           <span className="sv-meta"><span>{s.combos} settings</span>{s.style}</span>
         </button>
       ))}
-      {mine.length > 0 && <h6>Custom</h6>}
+      {mine.length > 0 && <h6>Yours</h6>}
       {mine.map((c) => (
-        <button key={c.id} type="button" className="sv-lib-row" title="Open in Custom JSON to run it again" onClick={() => onCustom(c)}>
+        <button key={c.id} type="button" className="sv-lib-row" title="Open in Your Pine to run it again" onClick={() => onEdit(c.source)}>
           <span className="sv-dot" />
           <span>
             <b>{c.title}</b>
             {c.description && <span className="sv-lib-sub">{c.description}</span>}
           </span>
-          <span className="sv-meta"><span>{c.combos} settings</span>ran {date(Date.parse(c.lastRun) / 1000)}</span>
+          <span className="sv-meta"><span>{c.combos ? `${c.combos} settings` : 'unscored'}</span>ran {date(Date.parse(c.lastRun) / 1000)}</span>
         </button>
       ))}
     </div>
   );
 }
 
-function CustomJson({ text, setText, check }: { text: string; setText: (s: string) => void; check: SpecCheck | null }) {
-  const [open, setOpen] = useState(false);
+/* The inputs worth listing: numbers (what a sweep can try) and dates. */
+function shownInput(i: PineInput): boolean {
+  return !!i.name && (i.type === 'int' || i.type === 'float' || i.type === 'time');
+}
+
+/* An input's default as a person reads it. A time input is milliseconds since
+ * the epoch, shown as its UTC date (and time, when it is not midnight). */
+function inputValue(i: PineInput): string {
+  if (i.type === 'time' && typeof i.default === 'number') {
+    const iso = new Date(i.default).toISOString();
+    return iso.endsWith('T00:00:00.000Z') ? iso.slice(0, 10) : `${iso.slice(0, 16).replace('T', ' ')} UTC`;
+  }
+  return String(i.default);
+}
+
+/* A plain textarea and, beside it, what the engine's checker says about it:
+ * the errors with their lines, then -- once it checks out -- the inputs and
+ * the values the sweep will try, N, and the costs it will be charged. */
+function PineEditor({ text, setText, check }: { text: string; setText: (s: string) => void; check: CheckState }) {
   const [copied, setCopied] = useState(false);
+  const r = check.result;
   return (
-    <div className="sv-custom">
-      <div className="sv-steps">
-        <div><b>01</b>Copy the prompt below.</div>
-        <div><b>02</b>Paste it into ChatGPT or Claude and describe your idea in plain English.</div>
-        <div><b>03</b>Paste the JSON it gives you here. We check it before running.</div>
+    <div className="sv-custom sv-pine">
+      <div className="sv-pine-grid">
+        <textarea className="sv-json sv-src" spellCheck={false} value={text} onChange={(e) => setText(e.target.value)}
+                  placeholder={'//@version=6\nstrategy("My idea", overlay=true, ...)\n\nlen = input.int(20, "Length")\n// @grid len = 10, 20, 40\n...'} />
+        <div className="sv-check" aria-live="polite">
+          {!text.trim() ? (
+            <div className="sv-check-empty">
+              Paste a Pine v6 strategy from TradingView, or one your AI wrote. Add
+              <span className="mono"> // @grid </span>lines to say which settings to try.
+            </div>
+          ) : check.busy && !r ? <div className="sv-v">Checking…</div>
+            : check.error ? <div className="sv-v bad">{check.error}</div>
+            : r && !r.ok ? (
+              <>
+                <div className="sv-v bad">{r.errors.length} problem{r.errors.length > 1 ? 's' : ''} to fix</div>
+                <ul className="sv-errs">{r.errors.slice(0, 8).map((m, i) => <li key={i}>{messageText(m)}</li>)}</ul>
+              </>
+            ) : r ? (
+              <>
+                <div className={`sv-v ${check.busy ? '' : 'ok'}`}>{check.busy ? 'Checking…' : `Checks out · ${r.title || 'Pine v6 strategy'}`}</div>
+                <div className="sv-check-n">
+                  <b>{r.scored ? r.grid.combinations : 1}</b>
+                  <small>{r.scored ? 'settings will be tried' : 'setting: no // @grid lines, so not scored'}</small>
+                </div>
+                {r.inputs.some(shownInput) && (
+                  <table className="sv-inputs">
+                    <thead><tr><th>Input</th><th>Default</th><th>Swept</th></tr></thead>
+                    <tbody>
+                      {r.inputs.filter(shownInput).map((i) => (
+                        <tr key={i.name!} title={i.title}>
+                          <td className="mono">{i.name}</td>
+                          <td className="mono">{inputValue(i)}</td>
+                          <td className="mono">{r.grid.values[i.name!]?.join(', ') ?? '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+                <div className="sv-note">{describeCosts(r.costs)}</div>
+                {r.warnings.slice(0, 4).map((m, i) => <div key={i} className="sv-warnbox">{messageText(m)}</div>)}
+              </>
+            ) : null}
+        </div>
       </div>
-      <div className={`sv-prompt ${open ? 'open' : ''}`}>
-        <header>
-          Sample prompt
-          <button type="button" onClick={() => setOpen(!open)}>{open ? 'Collapse' : 'Show all'}</button>
-          <button type="button" className={copied ? 'ok' : ''} onClick={async () => {
-            try { await navigator.clipboard.writeText(AI_PROMPT + '<' + PROMPT_PLACEHOLDER + '>'); } catch { /* denied */ }
-            setCopied(true); setTimeout(() => setCopied(false), 1600);
-          }}>{copied ? 'Copied' : 'Copy'}</button>
-        </header>
-        <pre>{AI_PROMPT}<em>{PROMPT_PLACEHOLDER}</em></pre>
-      </div>
-      <textarea className="sv-json" spellCheck={false} value={text} onChange={(e) => setText(e.target.value)}
-                placeholder='{ "name": "my_strategy", ... }' />
       <div className="sv-json-tools">
-        <span className={`sv-v ${check ? (check.ok ? 'ok' : 'bad') : ''}`}>
-          {!check ? 'Paste a strategy to check it'
-            : check.ok ? `Valid · ${check.settings} settings · ${check.combos} combinations to try`
-              : check.errors[0] + (check.errors.length > 1 ? `  (+${check.errors.length - 1} more)` : '')}
-        </span>
-        <button type="button" className="sv-link" onClick={() => setText(JSON.stringify(EXAMPLE_SPEC, null, 2))}>Load an example</button>
+        <span className="sv-v">Pine v6 · the same checker a run is held to</span>
+        <button type="button" className="sv-link" onClick={() => setText(EXAMPLE_PINE)}>Load an example</button>
+        <button type="button" className={`sv-link ${copied ? 'ok' : ''}`} style={{ marginLeft: 0 }} onClick={async () => {
+          try { await navigator.clipboard.writeText(AI_PROMPT + '<' + PROMPT_PLACEHOLDER + '>'); } catch { /* denied */ }
+          setCopied(true); setTimeout(() => setCopied(false), 1600);
+        }}>{copied ? 'Prompt copied' : 'Write it with AI'}</button>
       </div>
     </div>
   );
@@ -447,25 +567,27 @@ function CustomJson({ text, setText, check }: { text: string; setText: (s: strin
 
 /* ============================================================ running */
 
-function Running({ market, timeframe, bt, sw, combos }: { market: Market | null; timeframe: string; bt: Job | null; sw: Job | null; combos: number }) {
+function Running({ market, timeframe, bt, sw, combos, scored }: { market: Market | null; timeframe: string; bt: Job | null; sw: Job | null; combos: number; scored: boolean }) {
   const tf = market?.timeframes.find((t) => t.tf === timeframe);
   const queued = !bt || bt.status === 'queued';
   const btDone = bt?.status === 'done';
   const swProg = sw?.status === 'done' ? 1 : sw?.progress ?? 0;
-  const n = sw?.result?.combos ?? combos;
+  const n = scored ? sw?.result?.combos ?? combos : 1;
   const steps: [string, 'wait' | 'on' | 'done'][] = [
     [queued ? 'Waiting for the worker' : `Loaded ${tf ? tf.bars.toLocaleString() : ''} bars of ${market?.symbol} ${timeframe}`,
       queued ? 'on' : 'done'],
-    ['Backtested the chosen settings on train and test', btDone ? 'done' : queued ? 'wait' : 'on'],
-    [`Tried ${n} combinations × 2 windows`, sw?.status === 'done' ? 'done' : sw?.status === 'running' ? 'on' : 'wait'],
-    ['Ranked them on the test window only', sw?.status === 'done' ? 'done' : 'wait'],
+    ['Backtested the chosen settings on train, test and the holdout', btDone ? 'done' : queued ? 'wait' : 'on'],
+    ...(scored ? [
+      [`Tried ${n} combinations, each once over train and test`, sw?.status === 'done' ? 'done' : sw?.status === 'running' ? 'on' : 'wait'],
+      ['Ranked them on the test window only, and scored the grid', sw?.status === 'done' ? 'done' : 'wait'],
+    ] as [string, 'wait' | 'on' | 'done'][] : []),
   ];
   return (
     <div className="sv-running">
       <Trace />
-      <div className="sv-count"><span>{Math.round(n * swProg)}</span><small> / {n}</small></div>
-      <div className="sv-count-label">setting combinations tested on train and test</div>
-      <div className="sv-bar"><div style={{ width: `${Math.max(swProg * 100, btDone ? 30 : queued ? 4 : 15)}%` }} /></div>
+      <div className="sv-count"><span>{Math.round(n * (scored ? swProg : btDone ? 1 : 0))}</span><small> / {n}</small></div>
+      <div className="sv-count-label">{scored ? 'setting combinations tested on train and test' : 'setting tested (unscored)'}</div>
+      <div className="sv-bar"><div style={{ width: `${Math.max((scored ? swProg : btDone ? 1 : 0) * 100, btDone ? 30 : queued ? 4 : 15)}%` }} /></div>
       <ul className="sv-steps-run">
         {steps.map(([t, s]) => <li key={t} className={s}><i />{t}</li>)}
       </ul>

@@ -428,22 +428,36 @@ def test_sweep_resumes_with_moved_windows(btc):
     assert again["reused"] == again["evaluated"] and again["top"] == first["top"]
 
 
+def _pine_strategy(name="ema_cross"):
+    """A library strategy as a job's _strategy() returns it. Running Pine needs
+    the worker image; elsewhere the job tests are skipped."""
+    pytest.importorskip("pineforge_codegen")
+    from btb.pine import library as PL
+    from btb.pine import native as N
+    from btb.pine.program import Program
+    if not N.available():
+        pytest.skip("PineForge engine or the shim is not installed here")
+    prog = Program.from_source(PL.sources()[name])
+    return {"id": "sid", "name": name, "spec": {}, "spec_sha": prog.sha, "language": "pine",
+            "source": prog.source, "source_sha": prog.sha, "program": prog}
+
+
 def test_jobs_run_on_moved_windows_and_report_them(monkeypatch, btc):
-    """The payload's windows reach the runs, the resume lookup and the result;
-    bad ones are refused with the field's path before anything runs."""
+    """The payload's windows reach the runs and the result; bad ones are
+    refused with the field's path before anything runs."""
     from btb import db
     from btb.engine import jobs
     s = B.Series.from_frame(btc, "4h", symbol="BTC/USD", asset_class="crypto",
                             as_of=int(btc["ts"].iloc[-1]))
     sp = W.split(s.ts)
     moved = _moved(sp, s.ts)
-    strat = {"id": "sid", "name": "ema_cross", "spec": L.get("ema_cross"), "spec_sha": "x"}
+    strat = _pine_strategy()
     monkeypatch.setattr(jobs, "_strategy", lambda *a: strat)
     monkeypatch.setattr(jobs, "load_series", lambda *a: s)
-    runs, asked = [], []
+    runs = []
     monkeypatch.setattr(db, "insert_run", lambda conn, **kw: (runs.append(kw), (len(runs), True))[1])
     monkeypatch.setattr(db, "insert_runs", lambda conn, rows: runs.extend(rows))
-    monkeypatch.setattr(db, "runs_for_windows", lambda conn, **kw: (asked.append(kw["windows"]), {})[1])
+    monkeypatch.setattr(db, "job_progress", lambda *a, **kw: None)
 
     class Conn:
         def commit(self):
@@ -471,8 +485,12 @@ def test_jobs_run_on_moved_windows_and_report_them(monkeypatch, btc):
     # scored on the default windows, whatever was dragged.
     moved_w = {"train": (mv.train.start, mv.train.end), "test": (mv.test.start, mv.test.end)}
     default_w = {"train": (sp.train.start, sp.train.end), "test": (sp.test.start, sp.test.end)}
-    assert asked == [moved_w, default_w]
-    assert {(r["window_start"], r["window_end"]) for r in runs} ==         set(moved_w.values()) | set(default_w.values())
+    n = strat["program"].grid.n
+    # One run per combination, cut into train and test: the moved windows'
+    # rows first, then the default windows'.
+    assert len(runs) == 4 * n
+    assert {(r["window_start"], r["window_end"]) for r in runs[:2 * n]} == set(moved_w.values())
+    assert {(r["window_start"], r["window_end"]) for r in runs[2 * n:]} == set(default_w.values())
     assert out["windows"]["test"] == mv.test.as_dict()
     assert out["verdict"]["windows"] == sp.as_dict()
 
@@ -491,7 +509,7 @@ def test_extend_refreshes_only_the_holdout(monkeypatch, btc):
     s = B.Series.from_frame(btc, "4h", symbol="BTC/USD", asset_class="crypto",
                             as_of=int(btc["ts"].iloc[-1]))
     sp = W.split(s.ts)
-    strat = {"id": "sid", "name": "ema_cross", "spec": L.get("ema_cross"), "spec_sha": "x"}
+    strat = _pine_strategy()
     monkeypatch.setattr(jobs, "_strategy", lambda *a: strat)
     monkeypatch.setattr(jobs, "load_series", lambda *a: s)
     runs = []
@@ -549,17 +567,25 @@ def test_refresh_due_only_when_a_new_bar_has_closed():
     assert due == ["BTC/USD"]
 
 
-def test_custom_strategy_is_validated_and_owned(monkeypatch):
-    """A pasted spec is checked by the engine, and only its owner may run it."""
+def test_custom_strategy_is_checked_and_owned(monkeypatch):
+    """A pasted script is checked by the engine, only its owner may run it,
+    and a strategy in the retired JSON format is refused rather than run."""
+    pytest.importorskip("pineforge_codegen")
     from btb import db
     from btb.engine import jobs
-    good = L.get("ema_cross")
-    rows = {"mine": {"id": "mine", "user_id": "u1", "name": "x", "spec": good, "spec_sha": "s"},
-            "bad": {"id": "bad", "user_id": "u1", "name": "x", "spec_sha": "s",
-                    "spec": {**good, "entry_long": {"crossover": ["fast", "slow"]}}}}
+    from btb.pine import library as PL
+    good = PL.sources()["ema_cross"]
+    bad = good.replace("ta.ema(close, slow)", "ta.ema(close)")
+    row = lambda i, src, lang="pine": {"id": i, "user_id": "u1", "name": "x", "spec": {},  # noqa: E731
+                                       "spec_sha": i, "language": lang, "source": src,
+                                       "source_sha": i}
+    rows = {"mine": row("mine", good), "bad": row("bad", bad),
+            "old": {**row("old", None, "json"), "spec": L.get("ema_cross")}}
     monkeypatch.setattr(db, "strategy_by_id", lambda c, i: rows.get(i))
-    assert jobs._strategy(None, {"strategy_id": "mine"}, "u1")["id"] == "mine"
+    assert jobs._strategy(None, {"strategy_id": "mine"}, "u1")["program"].grid.n == 8
     with pytest.raises(jobs.JobError, match="unknown strategy"):
         jobs._strategy(None, {"strategy_id": "mine"}, "someone-else")
-    with pytest.raises(jobs.JobError, match="entry_long: unknown condition 'crossover'"):
+    with pytest.raises(jobs.JobError, match=r"problems: \d+:\d+: ta.ema is missing"):
         jobs._strategy(None, {"strategy_id": "bad"}, "u1")
+    with pytest.raises(jobs.JobError, match="retired JSON strategy format"):
+        jobs._strategy(None, {"strategy_id": "old"}, "u1")

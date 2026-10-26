@@ -320,19 +320,94 @@ not the authority: the worker re-validates every spec with the full rules
 before running it, and returns its exact error if it fails. Sweeps are capped
 at 500 combinations in both places.
 
+## Strategies in Pine (Weeks 7–8)
+
+The strategy picker's second and third tabs replaced "Custom JSON":
+
+- **Your Pine** -- a plain textarea (by decision: a code editor can come later,
+  nothing depends on it) and beside it what the engine's own checker says,
+  700 ms after the last keystroke: errors with line and column, then the
+  inputs, the values each `// @grid` line sweeps, N, the costs the script will
+  be charged, and warnings (zero costs, no grid). The checker is
+  `btb/pine/check.py`; the app cannot run it (the transpiler is Python), so
+  `/api/pine/check` queues a `check` job and waits for the checker service, a
+  second worker that claims nothing else (`lib/pineCheck.ts`). Answers are
+  cached by source hash, so checking as you type and checking again on Run is
+  one job.
+- **Connect your AI** -- the MCP address, steps for Claude, ChatGPT and Claude
+  Code, personal access tokens (shown once, revocable), connected OAuth apps
+  (disconnect revokes everything they hold), and the copy-prompt for a chatbot
+  without tools.
+
+The library is Pine now; a selected library strategy has "Edit as Pine". The
+costs field shows the script's own costs when it sets any, and the editable
+market defaults otherwise. A script with no `@grid` lines runs once: the run
+button says so, its card shows a dashed ring and "Unscored · no @grid", and its
+page explains why there is nothing to rank.
+
+`POST /api/backtests` takes `source` instead of `spec`: checked, stored as a
+`strategies` row with `language = 'pine'` (deduplicated by source hash), and
+run by id. `lib/queueTest.ts` holds the whole path so the MCP `run_test` tool
+queues exactly what the form does; `lib/tests.ts` holds the Results listing
+for the same reason.
+
+Tests made with the retired JSON format keep their pages and cards (marked
+"Legacy JSON · read-only"); their pages hide re-runs, window dragging and the
+holdout refresh, all of which would need the JSON engine to run again.
+
+`/?test=ID` opens one test directly. The MCP tools hand out these links.
+
+The Pine contract a model is shown lives in `backend/btb/pine/REFERENCE.md`.
+The app is built without the backend beside it, so
+`node scripts/sync-reference.mjs` copies it into `src/lib/pineReference.ts`;
+`backend/tests/test_pine_reference.py` fails if the copy is stale.
+
+## The MCP server (Weeks 7–8)
+
+`/api/mcp`, streamable HTTP, on the official TypeScript SDK
+(`@modelcontextprotocol/server` 2.x, `createMcpHandler`): a fresh server per
+request, bound to the bearer token's user, serving both the 2026 protocol and
+the 2025 stateless fallback. Six tools in the order a model uses them --
+`get_reference`, `list_markets`, `check_pine`, `run_test`, `get_test` (waits up
+to 50 s per call), `list_tests` -- plus a `write_strategy` prompt and the
+reference as a resource. Results are JSON text.
+
+Auth is the site acting as its own OAuth 2.1 authorization server, just enough
+for connectors to attach with no manual step:
+
+| Endpoint | Does |
+|---|---|
+| `/.well-known/oauth-protected-resource[/api/mcp]` | RFC 9728: where to authorize. The MCP 401 challenge points here. |
+| `/.well-known/oauth-authorization-server` | RFC 8414 metadata. |
+| `/oauth/register` | RFC 7591 dynamic registration. Public clients only; redirect URIs must be https, or http on localhost. |
+| `/oauth/authorize` | Sign in if needed (login takes a same-site `next`), then one consent screen. A bad client or unregistered redirect URI is shown here, never redirected to. |
+| `/oauth/token` | Code + PKCE S256 (required), or a refresh token. Codes are single-use; refresh tokens rotate on every use. |
+| `/api/tokens` | Personal access tokens and connected apps, for the Connect panel. |
+
+Every token is stored as its sha256 (`api_tokens`); access tokens last an
+hour, refresh tokens 30 days, personal tokens until revoked. A refresh token is
+not accepted as a bearer token. Checked end to end against the dev server:
+registration, the consent page, a wrong verifier, a replayed code, a reused
+refresh token and a disconnected app are all refused.
+
+`BTB_PUBLIC_URL` is the issuer and the address in every link; without it the
+request's own origin is used, which is right locally and wrong behind Caddy.
+
 ## Not built yet
 
 - **Paper trading** — opens a plain "arrives in weeks 9–12" screen, so the
   product's shape reads without faking what isn't built.
-- **Deployment.** Runs locally against the tunnel. Production needs the app
-  containerised beside Postgres on the Docker network, Caddy for TLS on :80/:443
-  (both free on the box), and a domain.
+- **Deployment** is written but not run: `web/Dockerfile` (Next standalone),
+  `deploy/Caddyfile`, and the web, checker and Caddy services in
+  `deploy/docker-compose.yml` / `up.sh`. It needs a domain pointed at the box
+  and ports 80/443 opened in the Oracle security list.
 - **Per-user isolation.** `user_id` columns exist on `strategies`, `jobs` and
   `runs`; nothing filters on them yet, because there is one user.
 
 ## Open questions
 
-1. **Domain name** — needed for TLS before the app is public.
+1. **Domain name** — needed for TLS before the app is public, and for Claude.ai
+   and ChatGPT connectors, which reach the MCP server from their own servers.
 2. **Data licensing.** Yahoo's terms prohibit redistribution. Serving
    Yahoo-derived prices from a public app is a different posture from private
    research use. Options: show only derived statistics, or move equities to a
@@ -341,3 +416,6 @@ at 500 combinations in both places.
    per-user cap.
 4. **Alpaca key** — equity intraday is capped at 53 days by Yahoo and is not
    research-grade. A free Alpaca account fixes it.
+5. **PineForge licence** — the transpiler's licence treats operating it for
+   other people's trading as commercial. Invited accounts only until the
+   licensor confirms a public academic deployment is fine.

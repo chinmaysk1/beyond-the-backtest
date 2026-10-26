@@ -54,5 +54,14 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
     }) : null;
     if (meta?.last_ts) out.latestTs = Number(meta.last_ts);
   }
+  if (job.kind === 'backtest') {
+    // Its sweep, so a link to the test alone (?test=ID, what the MCP tools
+    // hand out) can open the whole page.
+    const sw = await prisma.jobs.findFirst({
+      where: { user_id: user.id, kind: 'sweep', payload: { path: ['backtest'], equals: Number(job.id) } },
+      select: { id: true },
+    });
+    out.sweepId = sw ? Number(sw.id) : null;
+  }
   return NextResponse.json(out);
 }

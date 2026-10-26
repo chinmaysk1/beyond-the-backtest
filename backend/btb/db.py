@@ -291,20 +291,36 @@ def upsert_strategy(conn, strategy_id: str, name: str, spec: dict, sha: str,
             (strategy_id, user_id, name, json.dumps(spec), sha))
 
 
+def upsert_pine_strategy(conn, strategy_id: str, name: str, spec: dict, source: str,
+                         sha: str, user_id: str | None = None) -> None:
+    """Insert a Pine strategy version: its source, and in `spec` the
+    description the pages read. Same id rule as upsert_strategy."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO strategies (id, user_id, name, spec, spec_sha, language, source, "
+            "source_sha) VALUES (%s, %s, %s, %s, %s, 'pine', %s, %s) ON CONFLICT (id) DO NOTHING",
+            (strategy_id, user_id, name, json.dumps(spec), sha, source, sha))
+
+
+_STRATEGY_COLS = ("id::text AS id, user_id::text AS user_id, name, spec, spec_sha, "
+                  "language, source, source_sha")
+
+
 def latest_strategy(conn, name: str) -> dict | None:
-    """The newest library version of a strategy (user_id IS NULL)."""
+    """The newest library version of a strategy (user_id IS NULL). Pine
+    first: the JSON rows of the same names are the retired library, kept
+    only so old tests still open."""
     with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("SELECT id::text AS id, name, spec, spec_sha FROM strategies "
+        cur.execute(f"SELECT {_STRATEGY_COLS} FROM strategies "
                     "WHERE name = %s AND user_id IS NULL "
-                    "ORDER BY created_at DESC LIMIT 1", (name,))
+                    "ORDER BY (language = 'pine') DESC, created_at DESC LIMIT 1", (name,))
         return cur.fetchone()
 
 
 def strategy_by_id(conn, strategy_id: str) -> dict | None:
-    """One strategy version by id -- how a user's own (custom) spec is found."""
+    """One strategy version by id -- how a user's own strategy is found."""
     with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("SELECT id::text AS id, user_id::text AS user_id, name, spec, spec_sha "
-                    "FROM strategies WHERE id = %s", (strategy_id,))
+        cur.execute(f"SELECT {_STRATEGY_COLS} FROM strategies WHERE id = %s", (strategy_id,))
         return cur.fetchone()
 
 

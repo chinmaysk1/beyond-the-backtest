@@ -8,11 +8,13 @@ import type { CustomStrategyInfo } from '../../../../lib/types';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-/* The JSON strategies this user has run before, newest use first.
+/* The Pine strategies this user has run before, newest use first -- pasted on
+ * the Strategies tab or sent by their own AI.
  *
- * POST /api/backtests already stores each pasted spec as a strategies row
- * owned by the user, deduplicated by hash -- so one row is one distinct spec,
- * however many times it ran. The row's own time is its first run; the order
+ * POST /api/backtests already stores each script as a strategies row owned by
+ * the user, deduplicated by source hash -- so one row is one distinct script,
+ * however many times it ran. Their retired JSON strategies are not offered:
+ * they can no longer run. The row's own time is its first run; the order
  * here comes from its jobs, so a spec run again today rises to the top.
  */
 const MAX_SHOWN = 50;
@@ -24,8 +26,8 @@ export async function GET() {
 
   const [rows, jobs] = await Promise.all([
     prisma.strategies.findMany({
-      where: { user_id: user.id },
-      select: { id: true, name: true, spec: true, created_at: true },
+      where: { user_id: user.id, language: 'pine' },
+      select: { id: true, name: true, spec: true, source: true, created_at: true },
     }),
     prisma.jobs.findMany({
       where: { user_id: user.id, kind: 'backtest' },
@@ -44,6 +46,8 @@ export async function GET() {
   const strategies: CustomStrategyInfo[] = rows
     .map((r) => ({
       ...strategyInfo(r.name, r.spec as Record<string, any>),
+      language: 'pine' as const,
+      source: r.source ?? undefined,
       id: r.id,
       spec: r.spec as Record<string, any>,
       lastRun: (lastRun.get(r.id) ?? r.created_at).toISOString(),

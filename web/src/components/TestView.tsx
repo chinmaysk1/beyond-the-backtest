@@ -103,6 +103,7 @@ export default function TestView({ id, sweepId, onBack, onNewTest }: Props) {
   useEffect(() => {
     const r = bt?.result;
     if (!bt || bt.id !== id || bt.status !== 'done' || !r?.windows || extended.current === id) return;
+    if (isLegacy(bt)) return;          // the retired JSON format cannot run again
     const behind = !r.runs?.all || (bt.latestTs != null && bt.latestTs > r.windows.holdout.end);
     if (!behind) return;
     extended.current = id;
@@ -156,7 +157,7 @@ export default function TestView({ id, sweepId, onBack, onNewTest }: Props) {
   }
 
   async function applyRow(row: SweepRow) {
-    if (rerunning || rewind || !bt) return;
+    if (rerunning || rewind || !bt || isLegacy(bt)) return;
     const windows = spansOf(bt);
     const off = chosen === row.test_rank;          // clicking the chosen row goes back to the defaults
     setRerunning(true);
@@ -182,7 +183,7 @@ export default function TestView({ id, sweepId, onBack, onNewTest }: Props) {
   // waits and runs with the newest windows only.
   function commitWindows(h: Handles | null) {
     const r = bt?.result;
-    if (!r?.default_windows) return;
+    if (!r?.default_windows || (bt && isLegacy(bt))) return;
     const def = handlesOf(r.default_windows);
     const next = h ?? def;
     setDraft(next);
@@ -258,6 +259,32 @@ export default function TestView({ id, sweepId, onBack, onNewTest }: Props) {
   );
 }
 
+/* The costs a run was charged, as recorded with it (btb/pine/program.py
+ * cost_overrides): the script's own, or the market's defaults charged as
+ * commission; older JSON runs recorded commission and slippage directly. */
+type CostRecord = {
+  source?: 'script' | 'default'; commission_pct?: number | null; slippage_bps?: number | null;
+  commission_type?: string; commission_value?: number | null; slippage_ticks?: number | null;
+  charged_pct_per_side?: number;
+};
+function costPhrase(c: CostRecord | undefined): string {
+  if (c?.source === 'script') {
+    const comm = c.commission_type === 'percent' || c.commission_type == null
+      ? `${c.commission_value ?? 0}% commission` : `${c.commission_value ?? 0} ${c.commission_type} commission`;
+    return `the script’s own ${comm} + ${c.slippage_ticks ?? 0} ticks slippage`;
+  }
+  if (c?.source === 'default') {
+    return `${c.commission_pct ?? 0}% commission + ${c.slippage_bps ?? 0} bps slippage (charged as ${c.charged_pct_per_side}% a side)`;
+  }
+  return `${c?.commission_pct ?? 0}% commission + ${c?.slippage_bps ?? 0} bps slippage`;
+}
+
+/* A test made before strategies were Pine. Its job result says which
+ * language ran; results from before that field existed were all JSON. */
+function isLegacy(bt: Job): boolean {
+  return (bt.result as { language?: string } | null)?.language !== 'pine';
+}
+
 function BackButton({ onClick }: { onClick: () => void }) {
   return (
     <button type="button" className="sv-back" onClick={onClick}>
@@ -298,6 +325,8 @@ function Results({ title, bt, sw, view, setView, chosen, picked, rerunning, onUs
   const range = shownView === 'test' ? [w.test.start, w.test.end] : shownView === 'train' ? [w.train.start, w.train.end]
     : shownView === 'holdout' ? [w.holdout.start, w.holdout.end] : [w.train.start, w.test.end];
   const sr = sw?.status === 'done' ? sw.result : null;
+  // A script with no // @grid lines: its sweep finished with nothing to rank.
+  const unscored = (sr as { scored?: boolean } | null)?.scored === false;
   const rows = sr?.rows ?? sr?.top ?? [];
   // The score is for the settings on screen when they are among the scored
   // rows; otherwise the headline (#1 on the default windows) stands in. A
@@ -317,7 +346,8 @@ function Results({ title, bt, sw, view, setView, chosen, picked, rerunning, onUs
         <div className="sv-crumb"><b>{title || r.strategy}</b> · {r.symbol} · {r.timeframe} · data through {date(r.as_of)}
           {r.adjust !== 'none' ? ` · ${r.adjust}-adjusted` : ''}</div>
         {verdict ? <ScoreRing score={shownVerdict!.score} band={shownVerdict!.band} size="sm" title={shownVerdict!.reason} />
-          : <span className="sv-chip none" title={sw && sw.status !== 'done' && sw.status !== 'failed' ? 'Scored when the sweep finishes'
+          : <span className="sv-chip none" title={unscored ? 'The script has no // @grid lines, so one setting ran and there is nothing to score'
+            : sw && sw.status !== 'done' && sw.status !== 'failed' ? 'Scored when the sweep finishes'
             : 'This test has no score: its sweep failed, or it ran before scoring existed'}>
             {sw && sw.status !== 'done' && sw.status !== 'failed' ? 'Scoring…' : 'Unscored'}</span>}
         <button type="button" className="sv-link" onClick={onNewTest}>New test</button>
@@ -345,6 +375,10 @@ function Results({ title, bt, sw, view, setView, chosen, picked, rerunning, onUs
       {w.thin_sample && <div className="sv-warnline">
         {def && !sameHandles(ran, def) ? 'Train and test cover less than two years.' : 'Less than two years of data.'} Treat any result here as thin evidence.</div>}
       {error && <div className="sv-warnline bad">{error}</div>}
+      {isLegacy(bt) && (
+        <div className="sv-warnline">Made with the retired JSON strategy format: its results stay as they
+          were, but it can’t be re-run, moved or brought up to date.</div>
+      )}
 
       {bt.curve && (
         <EquityChart
@@ -371,12 +405,13 @@ function Results({ title, bt, sw, view, setView, chosen, picked, rerunning, onUs
 
       <section className={`sv-section ${rewind ? 'sv-stale' : ''}`}>
         <div className="sv-sech"><h3>Every setting</h3>
-          <p>{sr ? `All ${sr.combos} combinations, ranked on the test window (${date(sr.windows.test.start)} – ${date(sr.windows.test.end)}). Train rank alongside, because the two disagreeing is the warning sign.`
+          <p>{unscored ? 'Nothing to rank: the script has no // @grid lines, so only its default settings ran, and a single setting cannot be scored for overfitting. Add @grid lines for the inputs worth testing and run it again.'
+            : sr ? `All ${sr.combos} combinations, ranked on the test window (${date(sr.windows.test.start)} – ${date(sr.windows.test.end)}). Train rank alongside, because the two disagreeing is the warning sign.`
             : sw?.status === 'failed' ? `The sweep failed: ${sw.error}` : 'Still ranking…'}</p></div>
-        {sr && (
+        {sr && !unscored && (
           <div className="sv-best">
             <SweepTable rows={rows} combos={sr.combos ?? 0} verdict={verdict} varied={varied} labelOf={labelOf}
-                        chosen={chosen} busy={rerunning || !!rewind} running={rerunning} onUse={onUse} />
+                        chosen={chosen} busy={rerunning || !!rewind || isLegacy(bt)} running={rerunning} onUse={onUse} />
             {sr.ranks && <RankScatter ranks={sr.ranks} combos={sr.combos ?? 0} chosen={chosen} corr={sr.rank_corr ?? null} />}
           </div>
         )}
@@ -386,7 +421,7 @@ function Results({ title, bt, sw, view, setView, chosen, picked, rerunning, onUs
       {bt.trades && <TradeList trades={bt.trades} testStart={w.test.start} holdoutStart={w.holdout.start} stale={!settled} />}
 
       <div className="sv-costnote">
-        Every number above already pays <b>{m.costs?.commission_pct ?? 0}% commission + {m.costs?.slippage_bps ?? 0} bps slippage</b> on
+        Every number above already pays <b>{costPhrase(m.costs as CostRecord | undefined)}</b> on
         both sides of every trade: about {money((m.fees ?? 0) + (m.slippage ?? 0))} on a $10k start
         ({(m.cost_pct_of_capital ?? 0).toFixed(0)}% of it). Stops the price gaps through fill at the gap, not at the stop.
       </div>

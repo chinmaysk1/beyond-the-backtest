@@ -53,11 +53,47 @@ fi
 docker run --rm --network "$NET" -e BTB_DB_PASSWORD="$BTB_DB_PASSWORD" \
   btb-backend btb.data init
 
-# The worker: jobs, plus the data refresher when idle. Recreated on every run so
-# it always runs the image just built. One core, deliberately -- see README.
+# The worker: backtests and sweeps, plus the data refresher when idle.
+# Recreated on every run so it always runs the image just built. Two cores: a
+# sweep splits across two sandboxed processes -- see README.
+docker volume inspect btb_pinecache >/dev/null 2>&1 || docker volume create btb_pinecache >/dev/null
 docker rm -f btb-worker >/dev/null 2>&1 || true
 docker run -d --name btb-worker --network "$NET" --restart unless-stopped \
-  --cpus=1 --memory=2g \
+  --cpus=2 --memory=4g \
+  -v btb_pinecache:/var/cache/btb-pine \
   -e BTB_DB_PASSWORD="$BTB_DB_PASSWORD" -e TZ=UTC \
-  btb-backend btb.engine worker >/dev/null
+  btb-backend btb.engine worker --kinds backtest,sweep >/dev/null
 echo "worker started (docker logs -f btb-worker)"
+
+# The checker: answers Pine `check` jobs only, so they never wait behind a sweep.
+docker rm -f btb-checker >/dev/null 2>&1 || true
+docker run -d --name btb-checker --network "$NET" --restart unless-stopped \
+  --cpus=0.5 --memory=512m \
+  -e BTB_DB_PASSWORD="$BTB_DB_PASSWORD" -e TZ=UTC \
+  btb-backend btb.engine worker --kinds check --no-refresh --poll 0.1 >/dev/null
+echo "checker started"
+
+# The web app and Caddy only when a domain is set: without one there is no
+# certificate to get, and nothing public to serve.
+if [ -n "${BTB_DOMAIN:-}" ]; then
+  : "${BTB_SESSION_SECRET:?set BTB_SESSION_SECRET (32+ characters)}"
+  docker build -q -t btb-web "$(dirname "$0")/../web" >/dev/null
+  docker rm -f btb-web >/dev/null 2>&1 || true
+  docker run -d --name btb-web --network "$NET" --restart unless-stopped \
+    --cpus=0.75 --memory=1g \
+    -e DATABASE_URL="postgresql://btb:${BTB_DB_PASSWORD}@btb-postgres:5432/btb" \
+    -e SESSION_SECRET="$BTB_SESSION_SECRET" -e BTB_PUBLIC_URL="https://$BTB_DOMAIN" -e TZ=UTC \
+    btb-web >/dev/null
+  echo "web started"
+  for v in btb_caddy_data btb_caddy_config; do docker volume inspect "$v" >/dev/null 2>&1 || docker volume create "$v" >/dev/null; done
+  docker rm -f btb-caddy >/dev/null 2>&1 || true
+  docker run -d --name btb-caddy --network "$NET" --restart unless-stopped \
+    -p 80:80 -p 443:443 \
+    -e BTB_DOMAIN="$BTB_DOMAIN" \
+    -v "$(cd "$(dirname "$0")" && pwd)/Caddyfile:/etc/caddy/Caddyfile:ro" \
+    -v btb_caddy_data:/data -v btb_caddy_config:/config \
+    caddy:2.8-alpine >/dev/null
+  echo "caddy started for https://$BTB_DOMAIN (docker logs -f btb-caddy)"
+else
+  echo "BTB_DOMAIN not set: web and caddy not started"
+fi

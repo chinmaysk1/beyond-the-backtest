@@ -49,9 +49,12 @@ services:
   # (FOR UPDATE SKIP LOCKED), and when the queue is empty refreshes any stored
   # series with a newly closed bar -- which is what keeps the data current.
   #
-  # One core, not two. The box's other services are idle, but pinning both cores
-  # makes open-webui visibly laggy for the duration of a sweep -- and a sweep
-  # taking 30 seconds instead of 15 is not worth that.
+  # Two cores. It used to be pinned to one so open-webui stayed responsive
+  # during a sweep; with Pine (PineForge) a 15m sweep on one core took ~10
+  # minutes, and a sweep now splits its combinations across two sandboxed
+  # processes. open-webui may lag while a long sweep runs: accepted, for sweeps
+  # that finish in under five minutes. Data refresh and backtests stay
+  # single-process.
   worker:
     build: ../backend
     image: btb-backend
@@ -67,10 +70,75 @@ services:
       BTB_DB_USER: btb
       BTB_DB_PASSWORD: ${BTB_DB_PASSWORD:?set BTB_DB_PASSWORD}
       TZ: UTC
-    cpus: 1.0
-    mem_limit: 2g
-    command: ["btb.engine", "worker"]
+    cpus: 2.0
+    mem_limit: 4g
+    volumes:
+      - pinecache:/var/cache/btb-pine
+    command: ["btb.engine", "worker", "--kinds", "backtest,sweep"]
+
+  # The checker: answers `check` jobs only (is this Pine script acceptable,
+  # what will it sweep). Separate so a long sweep never makes the Strategies
+  # tab, or a user's AI calling check_pine, wait for a syntax check. Checking
+  # transpiles but never compiles or runs anything.
+  checker:
+    image: btb-backend
+    container_name: btb-checker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      BTB_DB_HOST: btb-postgres
+      BTB_DB_PORT: "5432"
+      BTB_DB_NAME: btb
+      BTB_DB_USER: btb
+      BTB_DB_PASSWORD: ${BTB_DB_PASSWORD:?set BTB_DB_PASSWORD}
+      TZ: UTC
+    cpus: 0.5
+    mem_limit: 512m
+    command: ["btb.engine", "worker", "--kinds", "check", "--no-refresh", "--poll", "0.1"]
+
+  # The web app. Reached only through Caddy; never published itself.
+  web:
+    build: ../web
+    image: btb-web
+    container_name: btb-web
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://btb:${BTB_DB_PASSWORD:?set BTB_DB_PASSWORD}@btb-postgres:5432/btb
+      SESSION_SECRET: ${BTB_SESSION_SECRET:?set BTB_SESSION_SECRET (32+ characters)}
+      BTB_PUBLIC_URL: https://${BTB_DOMAIN:?set BTB_DOMAIN}
+      TZ: UTC
+    cpus: 0.75
+    mem_limit: 1g
+
+  # TLS and the only public ports. Certificates live in the caddy volumes so a
+  # restart does not re-request them.
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: btb-caddy
+    restart: unless-stopped
+    depends_on:
+      - web
+    environment:
+      BTB_DOMAIN: ${BTB_DOMAIN:?set BTB_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
 
 volumes:
   pgdata:
     name: btb_pgdata
+  pinecache:
+    name: btb_pinecache
+  caddy_data:
+    name: btb_caddy_data
+  caddy_config:
+    name: btb_caddy_config

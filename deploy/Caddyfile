@@ -1,0 +1,25 @@
+# The only thing on this box that listens on a public interface.
+#
+# Caddy obtains and renews the TLS certificate for BTB_DOMAIN itself (ACME),
+# once the domain's A record points at this host and ports 80 and 443 are open
+# in the Oracle security list. Everything behind it -- the web app, the
+# workers, Postgres -- is reachable only on the `btb` Docker network.
+{$BTB_DOMAIN} {
+	encode gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "DENY"
+		-Server
+	}
+
+	reverse_proxy btb-web:3100 {
+		# The MCP get_test tool long-polls for up to 50 seconds.
+		transport http {
+			read_timeout 90s
+			write_timeout 90s
+		}
+	}
+}

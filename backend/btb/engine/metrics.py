@@ -72,8 +72,10 @@ def compute(f: Fills, ts: np.ndarray, close: np.ndarray, *, capital: float,
         "trades": len(pnl),
         "win_pct": _r(len(wins) / len(pnl) * 100) if pnl else None,
         "profit_factor": _r(gp / gl, 3) if gl > 0 else None,
-        "avg_trade_pct": _r(float(np.mean([p / e for p, e in zip(pnl, eq0)])) * 100)
-                         if pnl else None,
+        # Over trades entered with an account; a Pine run can keep trading
+        # after its equity reaches zero, where a return on zero is undefined.
+        "avg_trade_pct": _r(float(np.mean([p / e for p, e in zip(pnl, eq0) if e > 0])) * 100)
+                         if any(e > 0 for e in eq0) else None,
         "exposure_pct": _r(float(f.in_pos.mean()) * 100) if n else 0.0,
         "bh_pct": _r(bh * 100),
         "fees": _r(fees, 2),

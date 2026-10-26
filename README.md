@@ -19,10 +19,11 @@ current structure is in `proposal/PLAN.md`.
 
 ```
 backend/          Python — data layer, engine, statistics, worker
-  btb/            the package
+  btb/            the package (btb/pine: strategies in Pine, through PineForge)
   tests/          regression tests
   universe.json   the curated symbol list
-web/              Next.js application
+web/              Next.js application, and the MCP server (/api/mcp)
+deploy/           what runs on the server: compose file, up.sh, Caddyfile
 proposal/         proposal and plan
 ```
 
@@ -157,7 +158,8 @@ paper trading.
 
 ## Status — Weeks 2–3, the backtest engine and the Strategies experience
 
-`backend/btb/engine/`. A strategy is a JSON spec, never code; the engine turns
+`backend/btb/engine/`. (Weeks 7–8 replaced the JSON spec with Pine; see below.)
+A strategy is a JSON spec, never code; the engine turns
 it into trades with costs, stops and sizing inside the fill model, and records
 every run with the `as_of` and spec hash that reproduce it.
 
@@ -366,7 +368,128 @@ plain Python. Old engine against new over 455 configurations (every library
 strategy, both fill modes, both stop fills, 1× and 5× leverage, train, test and
 the verdict's return matrix) differ in 0, on the laptop and on the ARM server.
 
+## Status — Weeks 7–8, strategies in Pine, written by your own AI
+
+**A strategy is a TradingView Pine Script v6 file now.** The JSON spec could
+only say stateless things -- four boolean rules, one fixed stop -- and most
+real strategies need state: a regime flag set by one event and cleared by
+another, a trailing stop, bars since entry, scaling in. Pine is also what the
+people this is for already write. Scripts run through
+[PineForge](https://github.com/pineforge-4pass): its transpiler turns Pine into
+C++, `g++` compiles that once per script against its engine, and a small C shim
+of ours (`btb/pine/native/btb_shim.cpp`) drives the result from Python. The
+verdict engine, the score and Results did not change.
+
+```bash
+python -m btb.engine check  my_strategy.pine          # errors with line:col, inputs, grid, N, costs
+python -m btb.engine run     --file my_strategy.pine --symbol BTC/USD --timeframe 4h
+python -m btb.engine verdict --strategy ema_cross_adx --csv tests/fixtures/btcusd_4h.csv.gz --timeframe 4h
+python -m btb.engine reference                         # the Pine contract a model is shown
+python -m btb.engine worker --kinds check               # the checker: answers check jobs only
+```
+
+Pine runs in the worker image (`backend/Dockerfile`, on PineForge 1.6.0); a
+machine without it still runs everything else, and the Pine tests skip.
+
+| Module | Does |
+|---|---|
+| `pine/check.py` | Source -> errors and warnings with line and column, the inputs, the grid and N, the costs, the other markets it reads (resolved against the universe and fed to the engine). Adds the warning TradingView gives and PineForge does not: a `ta.*` call that runs on some bars only. The one judge: the web app, the MCP server and the worker all call it. |
+| `pine/pragmas.py` | `// @grid name = 10, 20, 40` (or `1 .. 5 step 0.5`) and `// @constraint a < b`, resolved against the inputs. Pure Python. No `@grid` lines means the script runs once and is not scored. |
+| `pine/native.py`, `native/btb_shim.cpp` | Compile once per C++ (cached by hash); run on our bars with inputs, cost overrides, a trade start and the symbol's tick, returning per-bar equity and trades. |
+| `pine/sandbox.py` | Native code runs only in forked children with memory and CPU limits and a wall-clock timeout; a crash or runaway loop fails the job, not the worker. |
+| `pine/program.py` | Engine output -> the same `Fills` the JSON engine produced, so metrics, curves, the sweep table and the verdict read it unchanged. The cost policy. One run per sweep combination. |
+| `pine/library/*.pine` | The six library strategies, ported. Each grid is the JSON one exactly, so N is unchanged. |
+| `pine/REFERENCE.md` | The contract: pragmas, costs, data, patterns that work, a complete example. Served to models by the MCP server and the copy-prompt from this one file. |
+
+**Parity is still the gate.** Each ported library strategy, with the three
+semantics the engines are meant to differ on set to the old engine's (below),
+trades exactly as the JSON engine did -- every entry and exit on the same bar at
+the same price -- across the default settings and a spread of the grid, from
+2016 on BTC 4h (`tests/test_pine.py`). One setting of one strategy is the
+exception, and is finding 9.
+
+**Costs: the script's own if it sets any, the market's if it sets none.**
+Pine charges slippage as a fixed number of ticks, which cannot say "5 bps" on a
+series that went from $10 to $100,000, so unset defaults are charged as
+commission (0.10% + 5 bps = 0.15% a side for crypto). A script that sets both
+to zero is run as written and flagged on its card.
+
+**One run per combination, two processes.** A scored test used to run every
+combination twice, once for train and test and once over the whole span for the
+score. Pine is slower per run than the vectorised engine, so each combination
+now runs once over train + test; the train and test numbers are cut from that
+run, and the score's daily returns come from the same equity curve. The worker
+gets the box's second core for sweeps. Measured on the ARM box, one core:
+the 81-setting BTC 4h grid in 5.8 s; the 500-setting 15m grid in 290 s, which
+the two changes bring to about 2.4 minutes.
+
+**Calibration holds.** On 50 random walks per market with the ported library:
+SPY 1d p95 29 and 15/300 (5.0%) at or above 30; BTC 4h p95 17 and 7/300 (2.3%).
+The bands stay where they were.
+
+**Your own AI, over MCP.** `/api/mcp` is a Model Context Protocol server with
+six tools -- `get_reference`, `list_markets`, `check_pine`, `run_test`,
+`get_test`, `list_tests` -- plus a `write_strategy` prompt. Claude and ChatGPT
+connectors sign in with OAuth 2.1 (dynamic client registration, PKCE required,
+rotating refresh tokens); Claude Code can use a personal access token. Every
+call is bound to the token's user. We run no model: the user's own does the
+writing, the site does the checking and the testing. A copy-prompt built from
+the same reference serves a chatbot with no tools. Details in `web/PLAN.md`.
+
+### What the port found
+
+Each was isolated by reading PineForge's values out of a run (a probe script
+that places orders sized by the indicator), not inferred from the trade lists.
+
+1. **EMA warm-up.** The JSON engine hid an EMA until it had n values;
+   PineForge shows it from bar 0, seeded with the first close, and warns that
+   this is its approximation ("PineForge may return a finite value before
+   TradingView does"). TradingView is on the JSON engine's side here. Early
+   entries move; nothing after the first few hundred bars does.
+2. **ADX across bars with no range.** BTC 4h has 980 bars where high, low and
+   the previous close are equal, almost all before 2016. Pine's `ta.dmi` carries
+   the last DI forward (`fixnan`) and keeps smoothing; the JSON engine skipped
+   the bar. ADX differs by up to ~8 points there, then converges.
+3. **Higher timeframes, one bar sooner.** On the last base bar of a 12h period,
+   `request.security` with lookahead off already shows the completed 12h value;
+   the JSON engine showed it one bar later. Neither looks ahead.
+4. **Sizing.** TradingView sizes a 100%-of-equity order so the commission fits:
+   positions are 0.1% smaller and final equity about 0.3% lower.
+5. **Margin calls.** Pine's default 100% margin partially liquidates a losing
+   short and keeps trading; the JSON engine ended the run at zero equity.
+6. **Order prices round to the tick.** A stop at 3.20306 fills at 3.20.
+7. **Exits are sized when placed.** A stop placed before its entry fills covers
+   the planned position, not the filled one; a margin call in between leaves
+   part of the position unprotected. The reference tells models to re-issue
+   `strategy.exit` every bar.
+8. **Stops gapped through fill at the open** -- the one rule both engines
+   already shared, which is why `stop_fill="gap"` was the setting that matched.
+9. **The JSON engine's Supertrend was not Pine's.** It decided a flip against
+   the previous bar's band; Pine compares the close with the current, ratcheted
+   band. On BTC 4h that changes one flip in about 470 trades for one setting.
+   The "Pine-exact named indicators" claim of Weeks 2–3 was wrong for this one.
+10. **A ruined account stays ruined.** With one run per combination, an account
+    lost during train starts the test window at zero, where a separate test run
+    had started fresh and hidden it. The first calibration run divided by that
+    zero; the test window is now reported as ruined.
+
+2 and 3 split the two Pine runtimes tried (PineTS agreed with the JSON engine
+on both); only TradingView can say which is right, and PineForge's published
+TradingView probes are the evidence so far. Both matter only in the first bars
+of a series and on illiquid stretches.
+
+**The JSON spec is retired, not deleted.** Tests made with it keep their pages,
+marked read-only; they cannot be re-run. `btb/engine/spec.py` and
+`btb/engine/library/*.json` stay as the oracle the Pine library is tested
+against (`--legacy` on the CLI runs them).
+
+**Licence.** PineForge's engine is Apache-2.0; its transpiler is under the
+PineForge Source License, free for non-commercial use and personal trading.
+Operating it for other people's trading may need the licensor's permission, so
+accounts stay invitation-only (there is no sign-up) until that is settled. The
+runtime sits behind one adapter; PineTS (AGPL) is the drop-in alternative.
+
 ## Next
 
-Weeks 7–8: the guided questions that pick a market and strategy, and strategies
-written in plain English through an LLM, with their UI.
+Weeks 9–12: paper trading -- the forward test from live data -- and the site
+going public behind Caddy.
